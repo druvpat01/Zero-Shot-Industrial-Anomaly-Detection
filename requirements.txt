@@ -1,0 +1,36 @@
+# Core anomaly detection
+anomalib
+torch
+torchvision
+onnxruntime
+
+# API / serving
+fastapi
+uvicorn[standard]
+pydantic>=2.0
+
+# Vision / numerics
+opencv-python
+numpy
+scikit-learn
+matplotlib
+Pillow
+
+# Datasets
+datasets
+huggingface_hub
+
+# Observability
+prometheus-client
+structlog
+opentelemetry-sdk
+opentelemetry-api
+
+# Infra
+redis
+python-dotenv
+
+# Testing
+pytest
+pytest-asyncio
+httpx

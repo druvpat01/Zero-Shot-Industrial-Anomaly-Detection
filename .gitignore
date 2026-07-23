@@ -1,0 +1,31 @@
+# Virtual environments
+venv/
+.venv/
+env/
+
+# Python bytecode
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Model artifacts
+*.pt
+*.ckpt
+*.onnx
+
+# Data — never commit real datasets (keep .gitkeep placeholders)
+data/**/*
+!data/**/.gitkeep
+
+# Evaluation outputs — track structure, not generated JSON (keep .gitkeep)
+results/**/*.json
+!results/**/.gitkeep
+
+# Environment / secrets
+.env
+
+# Notebooks
+notebooks/.ipynb_checkpoints/
+
+# OS / editor cruft
+.DS_Store
