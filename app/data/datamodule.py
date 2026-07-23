@@ -33,7 +33,8 @@ Example:
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import Iterator, Sequence
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
 
@@ -187,8 +188,40 @@ class DataModule:
         anomalib's ``Engine`` needs a real ``LightningDataModule`` to fit models
         such as PatchCore. Training entrypoints may reach for this; ordinary
         business logic must not, or the decoupling above is pointless.
+
+        Note that its dataloaders still yield :class:`DefectBatch`. To drive
+        ``Engine.fit`` you want :meth:`for_anomalib_engine` instead.
         """
         return self._datamodule
+
+    @contextmanager
+    def for_anomalib_engine(self) -> Iterator[MVTecAD]:
+        """Yield the anomalib datamodule with anomalib's *native* collate restored.
+
+        The plain-batch conversion above is what we want everywhere in our own
+        code, but anomalib's Lightning modules are not consumers of ours: their
+        ``validation_step`` calls ``batch.update(...)`` and their pre-processor
+        writes back to ``batch.gt_mask``, both of which are ``ImageBatch`` API.
+        Feeding them a :class:`DefectBatch` fails with an ``AttributeError``
+        several minutes into a fit.
+
+        So training — and only training — opts back into anomalib's own batch
+        type, scoped to a ``with`` block so no long-lived object is left in that
+        state:
+
+            >>> with dm.for_anomalib_engine() as anomalib_dm:   # doctest: +SKIP
+            ...     engine.fit(model=module, datamodule=anomalib_dm)
+
+        Yields:
+            The underlying :class:`~anomalib.data.MVTecAD` datamodule.
+        """
+        self._ensure_setup()
+        previous = self._datamodule.external_collate_fn
+        self._datamodule.external_collate_fn = None
+        try:
+            yield self._datamodule
+        finally:
+            self._datamodule.external_collate_fn = previous
 
     def prepare_data(self) -> None:
         """Ensure the dataset is present, downloading via anomalib if not.

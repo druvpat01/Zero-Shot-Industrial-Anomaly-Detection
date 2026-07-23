@@ -21,6 +21,11 @@ data/**/*
 results/**/*.json
 !results/**/.gitkeep
 
+# anomalib's Engine creates a versioned run workspace, results/<Model>/<Dataset>/
+# <category>/vN, on every fit. Our own artifacts go to results/checkpoints/.
+results/*/
+!results/checkpoints/
+
 # Environment / secrets
 .env
 
