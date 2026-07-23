@@ -13,6 +13,8 @@ from app.data.datamodule import (
     DataModule,
 )
 from app.data.transforms import (
+    CLIP_MEAN,
+    CLIP_STD,
     IMAGENET_MEAN,
     IMAGENET_STD,
     denormalize_image,
@@ -23,6 +25,8 @@ from app.data.transforms import (
 
 __all__ = [
     "BATCH_KEYS",
+    "CLIP_MEAN",
+    "CLIP_STD",
     "DEFAULT_CATEGORY",
     "DEFAULT_DATA_ROOT",
     "DEFAULT_IMAGE_SIZE",

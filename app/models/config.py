@@ -120,6 +120,26 @@ class ModelConfig(BaseModel):
         json_schema_extra=_env("IMAGENET_DIR"),
     )
 
+    # -- WinCLIP zero-shot -----------------------------------------------------
+
+    class_name: str | None = Field(
+        default=None,
+        description="Noun WinCLIP puts in its text prompts; None derives it from `category`.",
+        json_schema_extra=_env("WINCLIP_CLASS_NAME"),
+    )
+    k_shot: int = Field(
+        default=0,
+        ge=0,
+        description="Normal reference images WinCLIP may consult; 0 is pure zero-shot.",
+        json_schema_extra=_env("K_SHOT"),
+    )
+    scales: tuple[int, ...] = Field(
+        default=(2, 3),
+        min_length=1,
+        description="Sliding-window sizes, in ViT patches, WinCLIP aggregates scores over.",
+        json_schema_extra=_env("WINCLIP_SCALES"),
+    )
+
     # -- inference -------------------------------------------------------------
 
     image_size: int = Field(
@@ -194,6 +214,28 @@ class ModelConfig(BaseModel):
         """Accept ``MODEL_LAYERS="layer2,layer3"`` as well as a real sequence."""
         if isinstance(value, str):
             return tuple(part.strip() for part in value.split(",") if part.strip())
+        return value
+
+    @field_validator("scales", mode="before")
+    @classmethod
+    def _split_scales(cls, value: Any) -> Any:
+        """Accept ``WINCLIP_SCALES="2,3"`` as well as a real sequence of ints."""
+        if isinstance(value, str):
+            return tuple(int(part.strip()) for part in value.split(",") if part.strip())
+        return value
+
+    @field_validator("scales")
+    @classmethod
+    def _check_scales(cls, value: tuple[int, ...]) -> tuple[int, ...]:
+        """Reject window sizes that cannot tile WinCLIP's 15x15 patch grid.
+
+        A scale is a window edge measured in ViT patches, so 1 is a single patch
+        (no context at all, which the full-image scale already covers) and
+        anything past the grid produces zero windows and an empty score map.
+        """
+        if any(scale < 2 for scale in value):
+            msg = f"window scales must be at least 2 patches, got {value}"
+            raise ValueError(msg)
         return value
 
     @field_validator("category", "backbone", "accelerator")
@@ -289,6 +331,21 @@ class ModelConfig(BaseModel):
     def image_hw(self) -> tuple[int, int]:
         """``image_size`` as the ``(height, width)`` pair torchvision expects."""
         return (self.image_size, self.image_size)
+
+    @property
+    def prompt_class_name(self) -> str:
+        """The noun WinCLIP puts in its prompts: :attr:`class_name`, else :attr:`category`.
+
+        When it falls through to the category, underscores become spaces. MVTec's
+        folder names are identifiers (``metal_nut``, ``pill``) and CLIP's text
+        encoder was trained on prose: ``"a photo of a metal_nut."`` byte-pair
+        encodes into fragments it has never seen arranged that way, while
+        ``"a photo of a metal nut."`` is an ordinary English phrase whose
+        embedding sits where the visual embedding of an actual metal nut does.
+        The substitution is a no-op on single-word categories and free accuracy
+        on the compound ones.
+        """
+        return self.class_name or self.category.replace("_", " ")
 
 
 #: Environment variables this module reads, for documentation and tests.

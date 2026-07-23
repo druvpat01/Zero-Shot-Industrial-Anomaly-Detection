@@ -100,6 +100,12 @@ class AnomalyModel(ABC):
 
     model_name: str = "anomaly-model"
 
+    #: Interpolation used to resize a raw frame to ``image_size``. Bilinear is
+    #: right for a convolutional backbone; a backend whose weights were
+    #: pretrained under a different resize (WinCLIP's ViT, which open_clip
+    #: preprocesses with bicubic) overrides it rather than resizing twice.
+    _resize_mode: str = "bilinear"
+
     def __init__(self, config: ModelConfig) -> None:
         self.config = config
 
@@ -234,7 +240,7 @@ class AnomalyModel(ABC):
         tensor = F.interpolate(
             tensor,
             size=self.config.image_hw,
-            mode="bilinear",
+            mode=self._resize_mode,
             align_corners=False,
             antialias=True,
         )

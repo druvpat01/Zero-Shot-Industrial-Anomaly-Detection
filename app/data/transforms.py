@@ -21,6 +21,8 @@ import torch
 from PIL import Image
 
 __all__ = [
+    "CLIP_MEAN",
+    "CLIP_STD",
     "IMAGENET_MEAN",
     "IMAGENET_STD",
     "denormalize_image",
@@ -34,6 +36,16 @@ __all__ = [
 # noticeably if inputs are normalized with anything else.
 IMAGENET_MEAN: tuple[float, float, float] = (0.485, 0.456, 0.406)
 IMAGENET_STD: tuple[float, float, float] = (0.229, 0.224, 0.225)
+
+# Statistics of the web image-text corpus OpenAI's CLIP was pretrained on, and
+# the ones open_clip reproduces for its LAION checkpoints. Close enough to
+# ImageNet's to look interchangeable and different enough to matter: WinCLIP
+# scores by cosine similarity against *text* embeddings, so a systematic shift in
+# the image embedding moves every prompt's similarity at once and quietly rescales
+# the anomaly score. This is the only place in the codebase that needs them —
+# WinCLIP's ViT comes from open_clip, not timm.
+CLIP_MEAN: tuple[float, float, float] = (0.48145466, 0.4578275, 0.40821073)
+CLIP_STD: tuple[float, float, float] = (0.26862954, 0.26130258, 0.27577711)
 
 ImageLike = Image.Image | np.ndarray | torch.Tensor
 

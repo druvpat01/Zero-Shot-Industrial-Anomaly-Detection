@@ -4,6 +4,14 @@ torch
 torchvision
 onnxruntime
 
+# CLIP backbone for WinCLIP (anomalib's `clip` extra). The upper bound is
+# anomalib's own and it is load-bearing: from 2.26 open_clip's transformer
+# stack became batch-first, while anomalib's WinCLIP still permutes to
+# length-first before calling it by hand. The mismatch raises nothing — every
+# sliding window pools to the same vector, so the anomaly map comes back
+# perfectly uniform and the model looks merely bad rather than broken.
+open-clip-torch>=2.23.0,<2.26.1
+
 # API / serving
 fastapi
 uvicorn[standard]

@@ -10,6 +10,7 @@ from app.models.base import AnomalyModel, ModelOutput
 from app.models.config import ModelConfig, get_model_config
 from app.models.efficientad import EfficientADModel
 from app.models.patchcore import PatchCoreModel
+from app.models.winclip import WinCLIPModel
 
 __all__ = [
     "AnomalyModel",
@@ -17,5 +18,6 @@ __all__ = [
     "ModelConfig",
     "ModelOutput",
     "PatchCoreModel",
+    "WinCLIPModel",
     "get_model_config",
 ]
