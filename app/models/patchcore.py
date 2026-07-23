@@ -87,7 +87,6 @@ from typing import Any
 import lightning
 import numpy as np
 import torch
-import torch.nn.functional as F  # noqa: N812 - conventional alias
 # anomalib subclasses Lightning's ModelCheckpoint and only recognises its own
 # type when deciding whether to inject a default one. Importing Lightning's here
 # would land us with two checkpoint callbacks and a Trainer misconfiguration.
@@ -95,17 +94,13 @@ from anomalib.callbacks.checkpoint import ModelCheckpoint
 from anomalib.engine import Engine
 from anomalib.models import Patchcore
 
-from app.data.transforms import normalize_image, to_tensor
+from app.data.transforms import normalize_image
 from app.models.base import AnomalyModel, ModelOutput
 from app.models.config import ModelConfig, get_model_config
 
 __all__ = ["PatchCoreModel"]
 
 logger = logging.getLogger(__name__)
-
-#: A float image already scaled to [0, 1] never exceeds this; anything above it
-#: is a float array still on the 0-255 scale, which we rescale rather than reject.
-_UNIT_RANGE_TOLERANCE = 1.0 + 1e-3
 
 
 class PatchCoreModel(AnomalyModel):
@@ -374,7 +369,7 @@ class PatchCoreModel(AnomalyModel):
 
         array = self._to_rgb_array(image, color_order=color_order)
         height, width = array.shape[:2]
-        tensor = self._resize_and_normalize(array)
+        tensor = self._to_model_input(array)
 
         with torch.no_grad():
             # Deliberately calls the inner torch model rather than
@@ -491,102 +486,12 @@ class PatchCoreModel(AnomalyModel):
         except Exception:  # noqa: BLE001 - anomalib raises a bespoke UnassignedError
             return None
 
-    def _preprocess(self, image: np.ndarray, *, color_order: str = "rgb") -> torch.Tensor:
-        """Turn an arbitrary raw frame into a ``(1, 3, S, S)`` normalized tensor.
+    def _scale_for_model(self, tensor: torch.Tensor) -> torch.Tensor:
+        """Apply ImageNet normalization; the frozen WideResNet expects nothing else.
 
-        The full preprocessing contract in one call, for callers that do not
-        also need the input's dimensions.
-
-        Args:
-            image: Raw image array.
-            color_order: ``"rgb"`` or ``"bgr"``.
-
-        Returns:
-            Batched, ImageNet-normalized tensor at ``image_size``.
+        PatchCore's backbone is a bare timm model, so the statistics it was
+        pretrained with have to be applied before it sees the batch. (EfficientAD
+        normalizes inside its own PDN forward and therefore leaves the base
+        class's identity hook alone.)
         """
-        return self._resize_and_normalize(self._to_rgb_array(image, color_order=color_order))
-
-    @staticmethod
-    def _to_rgb_array(image: np.ndarray, *, color_order: str = "rgb") -> np.ndarray:
-        """Validate a raw frame and return it as a contiguous ``(H, W, 3)`` RGB array.
-
-        Args:
-            image: Raw image array.
-            color_order: ``"rgb"`` or ``"bgr"``.
-
-        Returns:
-            The image as 3-channel RGB, dtype unchanged.
-
-        Raises:
-            TypeError: If ``image`` is not a NumPy array.
-            ValueError: On an unsupported rank, channel count or ``color_order``.
-        """
-        if not isinstance(image, np.ndarray):
-            msg = f"predict() expects a numpy.ndarray, got {type(image).__name__}."
-            raise TypeError(msg)
-
-        order = color_order.lower()
-        if order not in {"rgb", "bgr"}:
-            msg = f"color_order must be 'rgb' or 'bgr', got {color_order!r}."
-            raise ValueError(msg)
-
-        array = np.asarray(image)
-        if array.ndim == 2:
-            array = array[:, :, None]
-        if array.ndim != 3:
-            msg = f"predict() expects (H, W), (H, W, 1), (H, W, 3) or (H, W, 4), got shape {image.shape}."
-            raise ValueError(msg)
-
-        channels = array.shape[2]
-        if channels == 1:  # grayscale sensor feed
-            array = np.repeat(array, 3, axis=2)
-        elif channels == 4:  # RGBA/BGRA screenshot or PNG with alpha
-            array = array[:, :, :3]
-        elif channels != 3:
-            msg = f"predict() expects 1, 3 or 4 channels, got {channels} (shape {image.shape})."
-            raise ValueError(msg)
-
-        if order == "bgr":
-            array = array[:, :, ::-1]
-
-        return np.ascontiguousarray(array)
-
-    def _resize_and_normalize(self, array: np.ndarray) -> torch.Tensor:
-        """Scale an ``(H, W, 3)`` RGB array to a normalized ``(1, 3, S, S)`` tensor."""
-        tensor = to_tensor(array)
-        if float(tensor.max()) > _UNIT_RANGE_TOLERANCE:
-            # A float frame still on the 0-255 scale; to_tensor only rescales uint8.
-            tensor = tensor / 255.0
-        tensor = tensor.clamp(0.0, 1.0).unsqueeze(0)
-
-        tensor = F.interpolate(
-            tensor,
-            size=self.config.image_hw,
-            mode="bilinear",
-            align_corners=False,
-            antialias=True,
-        )
         return normalize_image(tensor)
-
-    @staticmethod
-    def _to_input_resolution(anomaly_map: torch.Tensor, height: int, width: int) -> np.ndarray:
-        """Upsample the model's anomaly map to ``height x width`` as ``(H, W)`` float32.
-
-        PatchCore scores a coarse feature grid, so the map arrives at the
-        model's working resolution. Returning it at the *caller's* resolution is
-        part of the :class:`ModelOutput` contract — the caller should never have
-        to know what ``image_size`` was configured.
-        """
-        tensor = anomaly_map.detach().float()
-        while tensor.ndim > 3:  # (N, 1, H, W) -> (N, H, W)
-            tensor = tensor[:, 0]
-        if tensor.ndim == 2:  # already (H, W)
-            tensor = tensor.unsqueeze(0)
-
-        resized = F.interpolate(
-            tensor[:1].unsqueeze(1),
-            size=(height, width),
-            mode="bilinear",
-            align_corners=False,
-        )
-        return resized[0, 0].cpu().numpy().astype(np.float32)

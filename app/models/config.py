@@ -45,6 +45,10 @@ __all__ = ["ENV_PREFIXLESS_VARS", "ModelConfig", "get_model_config"]
 _REPO_ROOT = Path(__file__).resolve().parents[2]
 _DOTENV_PATH = _REPO_ROOT / ".env"
 
+#: Mirrors ``anomalib.models.image.efficient_ad.torch_model.EfficientAdModelSize``.
+#: Spelled out rather than imported so loading a config never drags in anomalib.
+_EFFICIENTAD_MODEL_SIZES: frozenset[str] = frozenset({"small", "medium"})
+
 
 def _env(name: str) -> dict[str, str]:
     """Declare which environment variable backs a field."""
@@ -103,6 +107,19 @@ class ModelConfig(BaseModel):
         json_schema_extra=_env("NUM_NEIGHBORS"),
     )
 
+    # -- EfficientAD student-teacher -------------------------------------------
+
+    model_size: str = Field(
+        default="small",
+        description="EfficientAD patch description network size: small | medium.",
+        json_schema_extra=_env("MODEL_SIZE"),
+    )
+    imagenet_dir: Path = Field(
+        default=_REPO_ROOT / "data" / "imagenette",
+        description="ImageNette root used by EfficientAD's distillation penalty.",
+        json_schema_extra=_env("IMAGENET_DIR"),
+    )
+
     # -- inference -------------------------------------------------------------
 
     image_size: int = Field(
@@ -136,7 +153,7 @@ class ModelConfig(BaseModel):
     max_epochs: int = Field(
         default=1,
         ge=1,
-        description="Training epochs. PatchCore is a single-pass model and pins this to 1.",
+        description="Training epochs. PatchCore is single-pass and pins this to 1; EfficientAD honours it.",
         json_schema_extra=_env("MAX_EPOCHS"),
     )
     accelerator: str = Field(
@@ -186,6 +203,20 @@ class ModelConfig(BaseModel):
             msg = "must not be blank"
             raise ValueError(msg)
         return value.strip()
+
+    @field_validator("model_size")
+    @classmethod
+    def _check_model_size(cls, value: str) -> str:
+        """Reject sizes anomalib's ``EfficientAdModelSize`` does not know.
+
+        Caught here rather than inside ``EfficientAd.__init__`` so a typo fails
+        at config load, not twenty minutes into a fit.
+        """
+        size = value.strip().lower()
+        if size not in _EFFICIENTAD_MODEL_SIZES:
+            msg = f"must be one of {sorted(_EFFICIENTAD_MODEL_SIZES)}, got {value!r}"
+            raise ValueError(msg)
+        return size
 
     # -- loading ---------------------------------------------------------------
 

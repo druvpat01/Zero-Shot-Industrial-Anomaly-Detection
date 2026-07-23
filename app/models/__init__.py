@@ -8,10 +8,12 @@ specific model.
 
 from app.models.base import AnomalyModel, ModelOutput
 from app.models.config import ModelConfig, get_model_config
+from app.models.efficientad import EfficientADModel
 from app.models.patchcore import PatchCoreModel
 
 __all__ = [
     "AnomalyModel",
+    "EfficientADModel",
     "ModelConfig",
     "ModelOutput",
     "PatchCoreModel",

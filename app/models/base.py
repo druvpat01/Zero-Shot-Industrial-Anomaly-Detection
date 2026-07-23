@@ -24,10 +24,17 @@ from dataclasses import dataclass
 from pathlib import Path
 
 import numpy as np
+import torch
+import torch.nn.functional as F  # noqa: N812 - conventional alias
 
+from app.data.transforms import to_tensor
 from app.models.config import ModelConfig
 
 __all__ = ["AnomalyModel", "ModelOutput"]
+
+#: A float image already scaled to [0, 1] never exceeds this; anything above it
+#: is a float array still on the 0-255 scale, which we rescale rather than reject.
+_UNIT_RANGE_TOLERANCE = 1.0 + 1e-3
 
 
 @dataclass(frozen=True)
@@ -150,3 +157,117 @@ class AnomalyModel(ABC):
 
     def __repr__(self) -> str:
         return f"{type(self).__name__}(model_name={self.model_name!r}, trained={self.is_trained})"
+
+    # -- shared image plumbing -------------------------------------------------
+    #
+    # :meth:`predict` promises the same thing for every backend: any raw frame
+    # in, a heatmap at *that frame's* resolution out. Everything below is the
+    # machinery that keeps that promise, and it lives here rather than in each
+    # wrapper so the promise cannot quietly drift apart between them. Backends
+    # differ only in :meth:`_scale_for_model`.
+
+    def _preprocess(self, image: np.ndarray, *, color_order: str = "rgb") -> torch.Tensor:
+        """Turn an arbitrary raw frame into a ``(1, 3, S, S)`` model input tensor.
+
+        Args:
+            image: Raw image array.
+            color_order: ``"rgb"`` or ``"bgr"``.
+
+        Returns:
+            Batched tensor at ``image_size``, scaled the way this backend wants.
+        """
+        return self._to_model_input(self._to_rgb_array(image, color_order=color_order))
+
+    @staticmethod
+    def _to_rgb_array(image: np.ndarray, *, color_order: str = "rgb") -> np.ndarray:
+        """Validate a raw frame and return it as a contiguous ``(H, W, 3)`` RGB array.
+
+        Args:
+            image: Raw image array.
+            color_order: ``"rgb"`` or ``"bgr"``.
+
+        Returns:
+            The image as 3-channel RGB, dtype unchanged.
+
+        Raises:
+            TypeError: If ``image`` is not a NumPy array.
+            ValueError: On an unsupported rank, channel count or ``color_order``.
+        """
+        if not isinstance(image, np.ndarray):
+            msg = f"predict() expects a numpy.ndarray, got {type(image).__name__}."
+            raise TypeError(msg)
+
+        order = color_order.lower()
+        if order not in {"rgb", "bgr"}:
+            msg = f"color_order must be 'rgb' or 'bgr', got {color_order!r}."
+            raise ValueError(msg)
+
+        array = np.asarray(image)
+        if array.ndim == 2:
+            array = array[:, :, None]
+        if array.ndim != 3:
+            msg = f"predict() expects (H, W), (H, W, 1), (H, W, 3) or (H, W, 4), got shape {image.shape}."
+            raise ValueError(msg)
+
+        channels = array.shape[2]
+        if channels == 1:  # grayscale sensor feed
+            array = np.repeat(array, 3, axis=2)
+        elif channels == 4:  # RGBA/BGRA screenshot or PNG with alpha
+            array = array[:, :, :3]
+        elif channels != 3:
+            msg = f"predict() expects 1, 3 or 4 channels, got {channels} (shape {image.shape})."
+            raise ValueError(msg)
+
+        if order == "bgr":
+            array = array[:, :, ::-1]
+
+        return np.ascontiguousarray(array)
+
+    def _to_model_input(self, array: np.ndarray) -> torch.Tensor:
+        """Scale an ``(H, W, 3)`` RGB array to a ``(1, 3, S, S)`` model input tensor."""
+        tensor = to_tensor(array)
+        if float(tensor.max()) > _UNIT_RANGE_TOLERANCE:
+            # A float frame still on the 0-255 scale; to_tensor only rescales uint8.
+            tensor = tensor / 255.0
+        tensor = tensor.clamp(0.0, 1.0).unsqueeze(0)
+
+        tensor = F.interpolate(
+            tensor,
+            size=self.config.image_hw,
+            mode="bilinear",
+            align_corners=False,
+            antialias=True,
+        )
+        return self._scale_for_model(tensor)
+
+    def _scale_for_model(self, tensor: torch.Tensor) -> torch.Tensor:
+        """Hook: put a ``[0, 1]`` batch on the scale this backend's network expects.
+
+        The default is the identity, which is right for any network that
+        normalizes internally. Backends fed a bare timm backbone override this
+        to apply ImageNet statistics.
+        """
+        return tensor
+
+    @staticmethod
+    def _to_input_resolution(anomaly_map: torch.Tensor, height: int, width: int) -> np.ndarray:
+        """Upsample a model anomaly map to ``height x width`` as ``(H, W)`` float32.
+
+        Models score at their own working resolution — a coarse feature grid for
+        PatchCore, the padded input grid for EfficientAD. Returning the map at
+        the *caller's* resolution is part of the :class:`ModelOutput` contract:
+        the caller should never have to know what ``image_size`` was configured.
+        """
+        tensor = anomaly_map.detach().float()
+        while tensor.ndim > 3:  # (N, 1, H, W) -> (N, H, W)
+            tensor = tensor[:, 0]
+        if tensor.ndim == 2:  # already (H, W)
+            tensor = tensor.unsqueeze(0)
+
+        resized = F.interpolate(
+            tensor[:1].unsqueeze(1),
+            size=(height, width),
+            mode="bilinear",
+            align_corners=False,
+        )
+        return resized[0, 0].cpu().numpy().astype(np.float32)
