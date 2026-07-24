@@ -3,6 +3,9 @@ anomalib
 torch
 torchvision
 onnxruntime
+# `onnx` is a runtime dependency of onnxruntime.quantization.quantize_dynamic
+# (INT8 export in scripts/export_onnx.py); onnxruntime does not pull it in itself.
+onnx
 
 # CLIP backbone for WinCLIP (anomalib's `clip` extra). The upper bound is
 # anomalib's own and it is load-bearing: from 2.26 open_clip's transformer

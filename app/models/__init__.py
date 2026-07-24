@@ -9,6 +9,7 @@ specific model.
 from app.models.base import AnomalyModel, ModelOutput
 from app.models.config import ModelConfig, get_model_config
 from app.models.efficientad import EfficientADModel
+from app.models.onnx_runner import ONNXRunner, onnx_artifact_path
 from app.models.patchcore import PatchCoreModel
 from app.models.winclip import WinCLIPModel
 
@@ -17,7 +18,9 @@ __all__ = [
     "EfficientADModel",
     "ModelConfig",
     "ModelOutput",
+    "ONNXRunner",
     "PatchCoreModel",
     "WinCLIPModel",
     "get_model_config",
+    "onnx_artifact_path",
 ]
