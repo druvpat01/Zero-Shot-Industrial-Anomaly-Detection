@@ -731,10 +731,14 @@ class WinCLIPModel(AnomalyModel):
         Raises:
             RuntimeError: Only when ``k_shot > 0`` and no reference embeddings
                 have been established. A zero-shot instance never raises here.
+            GuardError: If the frame fails the input-quality guard (blur,
+                exposure, resolution or aspect ratio) — see
+                :meth:`~app.models.base.AnomalyModel._guard_frame`.
         """
         module = self._require_module()
 
         array = self._to_rgb_array(image, color_order=color_order)
+        self._guard_frame(array)  # reject camera glitches / dirty lens / dead lighting before scoring
         height, width = array.shape[:2]
         tensor = self._to_model_input(array)
 

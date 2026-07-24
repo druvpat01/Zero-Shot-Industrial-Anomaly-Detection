@@ -28,6 +28,7 @@ import torch
 import torch.nn.functional as F  # noqa: N812 - conventional alias
 
 from app.data.transforms import to_tensor
+from app.guardrails import GuardError, GuardResult, guard
 from app.models.config import ModelConfig
 
 __all__ = ["AnomalyModel", "ModelOutput"]
@@ -183,6 +184,41 @@ class AnomalyModel(ABC):
             Batched tensor at ``image_size``, scaled the way this backend wants.
         """
         return self._to_model_input(self._to_rgb_array(image, color_order=color_order))
+
+    @staticmethod
+    def _guard_frame(frame: np.ndarray) -> GuardResult:
+        """Run the input-quality guard and raise if the frame is not worth scoring.
+
+        Called by every backend's :meth:`predict` before the resize-and-normalize
+        that feeds the network, so a camera glitch, fouled lens or lighting
+        failure is refused loudly here instead of being turned into a
+        plausible-looking anomaly score downstream. The guard is model-agnostic,
+        so it lives once on the base class and each :meth:`predict` invokes it —
+        the check is identical no matter which backend serves the frame.
+
+        It runs on the parsed 3-channel frame from :meth:`_to_rgb_array` rather
+        than the caller's raw argument, so structural problems (wrong type, rank
+        or channel count) still surface as the :class:`TypeError`/
+        :class:`ValueError` that method raises; the guard only judges quality.
+        The channel-order and channel-count normalization :meth:`_to_rgb_array`
+        does leaves the pixels' luminance untouched, so the quality verdict is
+        the raw frame's.
+
+        Args:
+            frame: The ``(H, W, 3)`` RGB frame returned by :meth:`_to_rgb_array`.
+
+        Returns:
+            The passing :class:`~app.guardrails.GuardResult`, so a caller can log
+            its metrics for drift monitoring.
+
+        Raises:
+            GuardError: If the frame fails any quality check, with the reason and
+                the metrics attached.
+        """
+        verdict = guard.validate(frame)
+        if not verdict.passed:
+            raise GuardError(verdict)
+        return verdict
 
     @staticmethod
     def _to_rgb_array(image: np.ndarray, *, color_order: str = "rgb") -> np.ndarray:

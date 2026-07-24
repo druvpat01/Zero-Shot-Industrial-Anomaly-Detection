@@ -292,9 +292,15 @@ def test_repeated_predicts_do_not_leak_forward_hooks(
             if getattr(fn, "__qualname__", "").endswith("get_feature_map.<locals>.hook")
         )
 
+    # A guard-passing synthetic frame: predict() now runs FrameGuard first, and a
+    # tiny all-black tile would be rejected (too_small + underexposed) before any
+    # forward pass, which is not what this test is about. Random noise at a valid
+    # resolution clears the gate cheaply.
+    frame = np.random.default_rng(0).integers(0, 256, size=(64, 64, 3), dtype=np.uint8)
+
     before = leaked_hooks()
     for _ in range(3):
-        zero_shot_model.predict(np.zeros((48, 48, 3), dtype=np.uint8))
+        zero_shot_model.predict(frame)
 
     assert leaked_hooks() == before == 0, "encode_image hooks are accumulating; _clear_leaked_hooks is not running"
 
