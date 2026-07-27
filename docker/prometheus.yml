@@ -1,0 +1,81 @@
+# Prometheus scrape configuration for the defect-detection API.
+#
+#   prometheus --config.file=docker/prometheus.yml
+#
+# or, from a container, mounted at the path Prometheus expects:
+#
+#   docker run --rm -p 9090:9090 \
+#     -v "$PWD/docker/prometheus.yml:/etc/prometheus/prometheus.yml" \
+#     --add-host=host.docker.internal:host-gateway \
+#     prom/prometheus
+#
+# The metrics themselves are defined in app/observability/metrics.py, and the
+# dashboard that reads them is docker/grafana/dashboards/defect_detection.json.
+
+global:
+  # 15s, matching the interval named in the build spec. Worth understanding
+  # rather than copying: this is the resolution limit of every rate() a
+  # dashboard computes. Prometheus needs at least two samples in a window to
+  # produce a rate at all, so the shortest usable range is 2x this (30s), and
+  # the panels in the Grafana dashboard use $__rate_interval precisely so they
+  # stay correct if this value is changed.
+  scrape_interval: 15s
+
+  # How long a single scrape may take before it is abandoned. Comfortably above
+  # what rendering a few hundred series costs (single-digit milliseconds) while
+  # staying well under scrape_interval — a timeout at or above the interval
+  # lets scrapes pile up on a struggling target and turns a slow server into an
+  # unreachable one.
+  scrape_timeout: 10s
+
+  # Attached to every series this Prometheus collects. Without it, federating
+  # or remote-writing two environments into one store silently merges them.
+  external_labels:
+    environment: local
+
+scrape_configs:
+  - job_name: defect-detection
+    metrics_path: /metrics
+
+    # No credential here, and that is deliberate rather than an oversight:
+    # GET /metrics is unauthenticated (see the endpoint docstring in
+    # app/serving/main.py). A scrape config is copied between environments and
+    # checked into version control, so putting an API key in one is how a
+    # working credential ends up in a git history. The endpoint is protected
+    # with a network control instead — bind it to an internal interface, or
+    # scrape through a sidecar.
+    static_configs:
+      - targets:
+          - localhost:8000
+        labels:
+          service: defect-detection
+
+    # `make serve` runs a single uvicorn worker, which is the case this file is
+    # written for. Under `uvicorn --workers N` each worker holds its own
+    # counters and a scrape reaches whichever one the OS picks, so a counter
+    # appears to jump backwards at random. Fix that by setting
+    # PROMETHEUS_MULTIPROC_DIR on the server (app/observability/metrics.py
+    # aggregates every worker's samples when it is set) rather than by listing
+    # the workers as separate targets here — they share a port and cannot be
+    # scraped individually.
+
+# No alerting rules ship with this file. Three are worth adding the moment this
+# runs anywhere real, and they are written out here rather than in a doc nobody
+# opens, because each maps to a metric that already exists:
+#
+#   - Guard rejection rate by reason climbing above its usual baseline:
+#       sum by (reason) (rate(guard_rejections_total[15m]))
+#     A rising `blurry` is a lens fouling. This fires hours before anybody
+#     notices the predictions have gone soft, which is the entire argument for
+#     the guard having its own counter.
+#
+#   - p95 inference latency crossing the line's cycle time:
+#       histogram_quantile(0.95, sum by (le, model) (rate(inference_latency_seconds_bucket[5m])))
+#     The threshold is a property of the production line, not of this service,
+#     so no default is asserted here.
+#
+#   - Defect rate departing from its historical band:
+#       sum(rate(images_processed_total{result="defective"}[1h]))
+#         / sum(rate(images_processed_total{result!="rejected_by_guard"}[1h]))
+#     Note the exclusion: rejected frames were never scored, and counting them
+#     as "not defective" makes a camera failure look like a quality improvement.

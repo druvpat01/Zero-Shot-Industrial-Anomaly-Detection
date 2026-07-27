@@ -28,7 +28,6 @@ last number.
 from __future__ import annotations
 
 import json
-import logging
 import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -39,10 +38,11 @@ import numpy as np
 from app.data import DataModule
 from app.evaluation.metrics import au_pro, f1_at_best_threshold, image_auroc, pixel_auroc
 from app.models.base import AnomalyModel
+from app.observability.logging_config import get_logger
 
 __all__ = ["BenchmarkResult", "BenchmarkRunner"]
 
-logger = logging.getLogger(__name__)
+log = get_logger(__name__)
 
 
 @dataclass
@@ -157,7 +157,7 @@ class BenchmarkRunner:
             :meth:`BenchmarkResult.as_dict`.
         """
         images, labels, masks = self._materialise_test_set()
-        logger.info(
+        log.info(
             "Benchmarking %d model(s) on %r: %d images (%d defective, %d normal), %d with masks.",
             len(self.models),
             self.datamodule.category,
@@ -169,11 +169,11 @@ class BenchmarkRunner:
 
         results: dict[str, BenchmarkResult] = {}
         for model in self.models:
-            logger.info("Scoring %s ...", model.model_name)
+            log.info("Scoring %s ...", model.model_name)
             predictions = self._collect_predictions(model, images, labels, masks)
             results[model.model_name] = self._score(model.model_name, predictions)
             r = results[model.model_name]
-            logger.info(
+            log.info(
                 "%s: img-AUROC=%.4f px-AUROC=%.4f AU-PRO=%.4f best-F1=%.4f (%.2fs, %.2fs/img)",
                 r.model_name,
                 r.image_auroc,
@@ -254,7 +254,7 @@ class BenchmarkRunner:
             px_auroc = pixel_auroc(predictions.gt_masks, predictions.pred_maps)
             region_au_pro = au_pro(predictions.gt_masks, predictions.pred_maps)
         else:
-            logger.warning("%s: no ground-truth masks available; pixel metrics reported as nan.", model_name)
+            log.warning("%s: no ground-truth masks available; pixel metrics reported as nan.", model_name)
             px_auroc = float("nan")
             region_au_pro = float("nan")
 
@@ -295,5 +295,5 @@ class BenchmarkRunner:
         stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
         destination = self.results_dir / f"benchmark_{self.datamodule.category}_{stamp}.json"
         destination.write_text(json.dumps(payload, indent=2), encoding="utf-8")
-        logger.info("Saved benchmark report to %s", destination)
+        log.info("Saved benchmark report to %s", destination)
         return destination

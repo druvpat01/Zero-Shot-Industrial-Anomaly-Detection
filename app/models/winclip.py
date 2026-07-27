@@ -189,7 +189,6 @@ Segmentation* (CVPR 2023), https://arxiv.org/abs/2303.14814
 
 from __future__ import annotations
 
-import logging
 import time
 from pathlib import Path
 from typing import Any
@@ -205,10 +204,11 @@ from anomalib.models import WinClip
 from app.data.transforms import CLIP_MEAN, CLIP_STD, normalize_image
 from app.models.base import AnomalyModel, ModelOutput
 from app.models.config import ModelConfig, get_model_config
+from app.observability.logging_config import get_logger
 
 __all__ = ["WinCLIPModel"]
 
-logger = logging.getLogger(__name__)
+log = get_logger(__name__)
 
 #: WinCLIP's input resolution, and not a hyperparameter. The backbone is
 #: ``ViT-B-16-plus-240``, whose learned positional embeddings are a 15x15 grid of
@@ -327,7 +327,7 @@ class WinCLIPModel(AnomalyModel):
             # Debug rather than warning: 256 is the process-wide default for the
             # other two backends, so this fires on almost every construction and
             # is not something the user did wrong.
-            logger.debug(
+            log.debug(
                 "Pinning image_size %d -> %d; WinCLIP's ViT-B-16-plus-240 has a fixed input size.",
                 base.image_size,
                 REQUIRED_IMAGE_SIZE,
@@ -452,7 +452,7 @@ class WinCLIPModel(AnomalyModel):
             scales=self.scales,
             pre_processor=self._build_pre_processor(),
         )
-        logger.info(
+        log.info(
             "Loaded CLIP backbone (ViT-B-16-plus-240) in %.1fs for class_name=%r, k_shot=%d, scales=%s",
             time.perf_counter() - started,
             self.class_name,
@@ -555,10 +555,10 @@ class WinCLIPModel(AnomalyModel):
         if self._module is None:
             checkpoint = self.checkpoint_path
             if checkpoint.is_file():
-                logger.info("No model in memory; loading calibration from %s", checkpoint)
+                log.info("No model in memory; loading calibration from %s", checkpoint)
                 self.load(checkpoint)
             elif self.is_zero_shot:
-                logger.info(
+                log.info(
                     "No calibration at %s; running uncalibrated zero-shot from the prompt ensemble for %r. "
                     "Scores are softmax probabilities over the normal/anomalous prompts, so they are still "
                     "in [0, 1]; run train() to sharpen them against this category.",
@@ -652,14 +652,14 @@ class WinCLIPModel(AnomalyModel):
             raise TypeError(msg)
 
         if datamodule.category != self.config.category:
-            logger.info(
+            log.info(
                 "Datamodule category %r overrides configured category %r",
                 datamodule.category,
                 self.config.category,
             )
             self.config = self.config.with_overrides(category=datamodule.category)
 
-        logger.info(
+        log.info(
             "'Training' %s on %r means encoding the prompt ensemble for %r and fitting score "
             "normalization — there are no gradients and no optimizer in this call.",
             self.model_name,
@@ -686,7 +686,7 @@ class WinCLIPModel(AnomalyModel):
         self._device = self._module.device
         self._module.eval()
 
-        logger.info(
+        log.info(
             "Set up %s for %r in %.1fs; class_name=%r, k_shot=%d, scales=%s, calibrated=%s",
             self.model_name,
             self.category,
@@ -697,7 +697,7 @@ class WinCLIPModel(AnomalyModel):
             self.is_calibrated,
         )
         if not self.is_calibrated:
-            logger.warning(
+            log.warning(
                 "No validation data was seen, so scores are raw prompt-similarity probabilities. "
                 "Still in [0, 1] — unlike PatchCore's, which would be meaningless here.",
             )
@@ -827,7 +827,7 @@ class WinCLIPModel(AnomalyModel):
 
         self._checkpoint_path = destination
         size_kb = destination.stat().st_size / 1024
-        logger.info(
+        log.info(
             "Saved %s calibration to %s (%.0f KB; CLIP weights deliberately excluded)",
             self.model_name,
             destination,
@@ -873,7 +873,7 @@ class WinCLIPModel(AnomalyModel):
         if saved_class_name != self.class_name or saved_scales != tuple(self.scales):
             # Not fatal: the file's embeddings win, and they are self-consistent.
             # But the config now describes something the loaded model is not.
-            logger.warning(
+            log.warning(
                 "Calibration in %s was fitted for class_name=%r scales=%s; this instance is configured for "
                 "class_name=%r scales=%s. Using the file's.",
                 source,
@@ -897,7 +897,7 @@ class WinCLIPModel(AnomalyModel):
             raise ValueError(msg)
         missing = [key for key in incompatible.missing_keys if not key.startswith(_CLIP_WEIGHT_PREFIX)]
         if missing:
-            logger.warning("Calibration in %s is missing %s; those keep their freshly built values.", source, missing)
+            log.warning("Calibration in %s is missing %s; those keep their freshly built values.", source, missing)
 
         module.model.class_name = saved_class_name or self.class_name
         module.model.k_shot = int(payload.get("k_shot", 0))
@@ -910,7 +910,7 @@ class WinCLIPModel(AnomalyModel):
         module.eval()
         self._module = module
         self._checkpoint_path = source
-        logger.info(
+        log.info(
             "Loaded %s from %s; class_name=%r, k_shot=%d, calibrated=%s",
             self.model_name,
             source,

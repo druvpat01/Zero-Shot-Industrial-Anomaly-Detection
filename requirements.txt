@@ -37,6 +37,14 @@ structlog
 opentelemetry-sdk
 opentelemetry-api
 
+# OTLP span export, needed only when OTEL_EXPORTER_OTLP_ENDPOINT points at a real
+# collector. The SDK does not pull it in, and the default ConsoleSpanExporter
+# needs nothing, so it is left commented rather than adding ~10 MB of protobuf
+# machinery to every install. app/observability/tracing.py degrades to the
+# console exporter with an ERROR log if an endpoint is set without this present —
+# a missing telemetry dependency must not stop an inspection line from answering.
+# opentelemetry-exporter-otlp-proto-http
+
 # Infra
 redis
 python-dotenv

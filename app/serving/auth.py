@@ -59,7 +59,6 @@ request.
 from __future__ import annotations
 
 import hmac
-import logging
 import os
 from collections.abc import Mapping
 from dataclasses import dataclass
@@ -70,6 +69,8 @@ from typing import Callable, Literal
 from dotenv import load_dotenv
 from fastapi import Depends, HTTPException, Security, status
 from fastapi.security import APIKeyHeader
+
+from app.observability.logging_config import get_logger
 
 __all__ = [
     "API_KEY_HEADER",
@@ -83,7 +84,7 @@ __all__ = [
     "require_viewer",
 ]
 
-logger = logging.getLogger(__name__)
+log = get_logger(__name__)
 
 # ---------------------------------------------------------------------------
 # In production, replace with OAuth2/JWT and a proper identity provider. .env
@@ -175,7 +176,7 @@ class Principal:
 
     Deliberately does *not* carry the raw key. Handlers receive a
     :class:`Principal`, log it and audit it, and there is no path from one back
-    to a usable credential — so an accidental ``logger.info("%s", principal)``
+    to a usable credential — so an accidental ``log.info("caller", p=principal)``
     cannot leak anything.
 
     Attributes:
@@ -238,20 +239,19 @@ class AuthConfig:
         )
 
         if not config.is_configured:
-            logger.error(
-                "No API keys configured (%s / %s are unset or blank). Every authenticated "
-                "endpoint will refuse requests with 503 auth_not_configured; only /health "
-                "will answer. Set them in .env — see .env.example.",
-                _VIEWER_KEYS_VAR,
-                _OPERATOR_KEYS_VAR,
+            log.error(
+                "auth_not_configured",
+                variables=[_VIEWER_KEYS_VAR, _OPERATOR_KEYS_VAR],
+                impact="every authenticated endpoint will refuse requests with 503; only /health and /metrics answer",
+                fix="set them in .env — see .env.example",
             )
         else:
             # Counts, never the keys. Enough to spot "I set the wrong variable"
             # from a startup log without putting a credential in one.
-            logger.info(
-                "Auth configured: %d viewer key(s), %d operator key(s).",
-                len(config.viewer_keys),
-                len(config.operator_keys),
+            log.info(
+                "auth_configured",
+                viewer_keys=len(config.viewer_keys),
+                operator_keys=len(config.operator_keys),
             )
         return config
 
@@ -346,7 +346,7 @@ def _authorize(api_key: str | None, config: AuthConfig, *, required: Role) -> Pr
     if not config.is_configured:
         # Logged every time rather than once: this is a broken deployment, and
         # the line is what tells an operator why their API is answering 503.
-        logger.error("Rejecting an authenticated request: no API keys are configured on this server.")
+        log.error("auth_rejected", detail="auth_not_configured", required_role=required)
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
             detail="auth_not_configured",
@@ -360,15 +360,21 @@ def _authorize(api_key: str | None, config: AuthConfig, *, required: Role) -> Pr
         # The presented key is hashed, not printed. An unrecognised key is very
         # often a *valid* key for another environment — logging it verbatim is
         # how a staging credential ends up in a production log aggregator.
-        logger.warning("Rejected an unknown API key (%s).", hash_api_key(api_key.strip()))
+        log.warning(
+            "auth_rejected",
+            detail="invalid_api_key",
+            caller=hash_api_key(api_key.strip()),
+            required_role=required,
+        )
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="invalid_api_key")
 
     if required not in _ROLE_GRANTS[principal.role]:
-        logger.warning(
-            "Denied %s: role %r does not grant %r.",
-            principal,
-            principal.role,
-            required,
+        log.warning(
+            "auth_rejected",
+            detail="insufficient_role",
+            caller=principal.key_id,
+            role=principal.role,
+            required_role=required,
         )
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="insufficient_role")
 

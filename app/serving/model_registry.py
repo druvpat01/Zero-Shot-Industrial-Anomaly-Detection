@@ -53,7 +53,6 @@ make a latency or accuracy regression impossible to explain.
 
 from __future__ import annotations
 
-import logging
 import threading
 import time
 from pathlib import Path
@@ -67,10 +66,12 @@ from app.models.efficientad import EfficientADModel
 from app.models.onnx_runner import ONNXRunner, onnx_artifact_path
 from app.models.patchcore import PatchCoreModel
 from app.models.winclip import WinCLIPModel
+from app.observability.logging_config import get_logger
+from app.observability.metrics import set_models_loaded
 
 __all__ = ["ModelNotReadyError", "ModelRegistry", "get_registry"]
 
-logger = logging.getLogger(__name__)
+log = get_logger(__name__)
 
 #: Backends backed by a PyTorch wrapper -> the class that implements them.
 _TORCH_BACKENDS: dict[str, Callable[..., AnomalyModel]] = {
@@ -199,6 +200,12 @@ class ModelRegistry:
         """Drop every cached model. Frees the weights; used by tests."""
         with self._table_lock:
             self._models.clear()
+            remaining = len(self._models)
+        # The unload half of ``models_loaded_count``. Published from inside the
+        # only two methods that change the dict's size, so the gauge cannot drift
+        # away from the truth the way an inc/dec pair around a load that raised
+        # would.
+        set_models_loaded(remaining)
 
     def describe(self, category: str) -> list[dict[str, object]]:
         """Report every backend's availability for ``category``, loading nothing.
@@ -307,6 +314,11 @@ class ModelRegistry:
             if cached is not None:
                 return cached
 
+            # Resolved before the load so the log line can name the file even
+            # when the load fails: "which artifact was it reaching for" is the
+            # first question a ModelNotReadyError raises.
+            artifact, artifact_detail = self._artifact_for(name, category)
+
             started = time.perf_counter()
             model = self._load(name, category)
             if self._warmup:
@@ -315,13 +327,25 @@ class ModelRegistry:
 
             with self._table_lock:
                 self._models[key] = model
-            logger.info(
-                "Loaded backend %r for category %r in %.1fs as %r (calibrated=%s)",
-                name,
-                category,
-                elapsed,
-                model.model_name,
-                model.is_calibrated,
+                loaded_count = len(self._models)
+            set_models_loaded(loaded_count)
+
+            # The model-load event. `model_name` is reported separately from
+            # `backend` on purpose — they differ exactly when a PyTorch backend
+            # fell back to its ONNX export, and that substitution is the single
+            # most common explanation for "the numbers changed and nothing was
+            # deployed". A field that is usually redundant earns its place by
+            # being unmissable on the day it is not.
+            log.info(
+                "model_loaded",
+                backend=name,
+                category=category,
+                model_name=model.model_name,
+                checkpoint=None if artifact is None else str(artifact),
+                checkpoint_detail=artifact_detail,
+                duration_seconds=round(elapsed, 3),
+                calibrated=model.is_calibrated,
+                models_loaded=loaded_count,
             )
             return model
 
@@ -372,7 +396,14 @@ class ModelRegistry:
             except Exception as exc:
                 # A checkpoint that exists but will not load is a not-ready
                 # server, not a failed request: same 503, same retry advice.
-                logger.exception("Failed to load %s checkpoint %s", backend, checkpoint)
+                log.error(
+                    "model_load_failed",
+                    backend=backend,
+                    category=category,
+                    checkpoint=str(checkpoint),
+                    error=type(exc).__name__,
+                    exc_info=True,
+                )
                 raise ModelNotReadyError(
                     backend,
                     category,
@@ -382,14 +413,14 @@ class ModelRegistry:
 
         fallback = self._onnx_path(backend)
         if fallback.is_file():
-            logger.warning(
-                "No %s checkpoint at %s; falling back to the ONNX export at %s. "
-                "Responses will report model_name=%r, not %r.",
-                backend,
-                checkpoint,
-                fallback,
-                f"onnx_{backend}",
-                backend,
+            log.warning(
+                "model_backend_substituted",
+                backend=backend,
+                category=category,
+                checkpoint=str(checkpoint),
+                fallback=str(fallback),
+                served_as=f"onnx_{backend}",
+                reason="no checkpoint on disk; serving the ONNX export instead",
             )
             return self._build_onnx(fallback, f"onnx_{backend}", category)
 
@@ -413,7 +444,14 @@ class ModelRegistry:
         try:
             return ONNXRunner(path, model_name=model_name, config=self._config_for(category))
         except Exception as exc:
-            logger.exception("Failed to open ONNX session for %s", path)
+            log.error(
+                "onnx_session_failed",
+                model_name=model_name,
+                category=category,
+                artifact=str(path),
+                error=type(exc).__name__,
+                exc_info=True,
+            )
             raise ModelNotReadyError(
                 model_name,
                 category,
@@ -434,13 +472,24 @@ class ModelRegistry:
         try:
             model.predict(frame, color_order="rgb")
         except Exception as exc:
-            logger.exception("Warm-up inference failed for backend %r on category %r", backend, category)
+            log.error(
+                "model_warmup_failed",
+                backend=backend,
+                category=category,
+                error=type(exc).__name__,
+                exc_info=True,
+            )
             raise ModelNotReadyError(
                 backend,
                 category,
                 f"the model loaded but failed its warm-up inference: {type(exc).__name__}",
             ) from exc
-        logger.debug("Warmed %r for %r in %.2fs", backend, category, time.perf_counter() - started)
+        log.debug(
+            "model_warmed",
+            backend=backend,
+            category=category,
+            duration_seconds=round(time.perf_counter() - started, 3),
+        )
 
 
 #: The process-wide registry. Reached through :func:`get_registry` rather than

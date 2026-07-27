@@ -17,9 +17,10 @@ defect that is really just dirt on the glass.
 :class:`FrameGuard` is the loud refusal. It runs four cheap, model-independent
 checks on the raw frame and returns a :class:`GuardResult` saying whether the
 frame is worth scoring and, if not, why. The model wrappers call it before they
-preprocess, so a bad frame is rejected in microseconds instead of being scored
-in milliseconds-to-seconds and quietly corrupting the numbers a performance
-claim rests on.
+preprocess, so a bad frame is rejected in a few milliseconds instead of being
+scored in hundreds of them and quietly corrupting the numbers a performance
+claim rests on. (What "a few" means is measured, not assumed — see "What this
+module reports about itself" below.)
 
 The checks
 ==========
@@ -46,6 +47,36 @@ The checks
 Every threshold is configurable from the environment (see
 :class:`GuardConfig`), so a line with a different camera, resolution or lighting
 budget can retune the gate without a code change.
+
+What this module reports about itself
+=====================================
+:meth:`FrameGuard.validate` is instrumented directly rather than at its call
+sites, because it has several: the API handler in :mod:`app.serving.main`, every
+model wrapper via :meth:`app.models.base.AnomalyModel._check_frame`, and the
+demo script. Two Prometheus series come out of it (see
+:mod:`app.observability.metrics`):
+
+* ``guard_check_latency_seconds`` — the honesty check on this module's central
+  claim, and it has already corrected it. The guard was documented here as
+  costing "microseconds"; measured, it costs **1.3 ms on a 256x256 frame and
+  23 ms on a real 900x900 MVTec frame**. Every check is O(H*W) over a ``float64``
+  copy, so the cost scales with the frame rather than being a fixed overhead.
+  The design still holds — 23 ms against a ~1 s forward pass is ~2% of the
+  request, and rejecting a bad frame that cheaply is still clearly worth it —
+  but the figure is two orders of magnitude off what was written, and the
+  histogram is what caught it.
+* ``guard_rejections_total{reason}`` — the operationally interesting one. A
+  rising ``blurry`` rate is a lens acquiring a film of coolant, and it is visible
+  here hours before anybody notices the predictions have gone soft.
+
+Rejections are counted here but *not logged* here. The log line belongs at the
+two places the :class:`GuardError` is raised — :meth:`app.models.base.AnomalyModel._check_frame`
+for the model path and ``predict`` in :mod:`app.serving.main` for the API path —
+because those are the places that hold the request context (``request_id``,
+``model_backend``, ``category``) that makes the line worth reading. Logging here
+as well would double every rejection; logging in the API's *exception handler*
+instead would silently lose that context, for a reason worth reading in
+:func:`app.serving.main._handle_guard_error`.
 """
 
 from __future__ import annotations
@@ -57,6 +88,8 @@ from typing import Callable, TypeVar
 
 import cv2
 import numpy as np
+
+from app.observability.metrics import observe_guard_check, record_guard_rejection
 
 __all__ = ["GuardConfig", "GuardError", "GuardResult", "FrameGuard"]
 
@@ -235,12 +268,13 @@ class FrameGuard:
     def validate(self, image: np.ndarray) -> GuardResult:
         """Check one frame and report a verdict plus every metric behind it.
 
-        The checks are evaluated most-fundamental first — resolution, then
-        aspect ratio, then exposure, then blur — and the first failure decides
-        :attr:`GuardResult.reason`. That order is deliberate: a 10x10 all-black
-        tile fails several checks at once, and "too_small" is the more useful
-        thing to tell an operator than "underexposed". Every metric is computed
-        regardless, so a rejection still logs a full row for drift monitoring.
+        Timed into ``guard_check_latency_seconds`` and, on a rejection, counted
+        into ``guard_rejections_total{reason}`` — see the module docstring for
+        why the instrumentation lives here and the log line does not. The timing
+        is in a ``finally``, so a frame that raises on its way through is still
+        observed: a malformed input is the one case where the guard could
+        plausibly become slow, and it would otherwise be the one case missing
+        from the histogram.
 
         Args:
             image: ``(H, W)``, ``(H, W, 1)``, ``(H, W, 3)`` or ``(H, W, 4)``
@@ -254,6 +288,23 @@ class FrameGuard:
             TypeError: If ``image`` is not a NumPy array.
             ValueError: If it is not a 2-D or 3-D array, or has a zero-sized
                 dimension.
+        """
+        with observe_guard_check():
+            result = self._evaluate(image)
+
+        if not result.passed and result.reason is not None:
+            record_guard_rejection(result.reason)
+        return result
+
+    def _evaluate(self, image: np.ndarray) -> GuardResult:
+        """Run the checks. The verdict itself, with no instrumentation around it.
+
+        The checks are evaluated most-fundamental first — resolution, then
+        aspect ratio, then exposure, then blur — and the first failure decides
+        :attr:`GuardResult.reason`. That order is deliberate: a 10x10 all-black
+        tile fails several checks at once, and "too_small" is the more useful
+        thing to tell an operator than "underexposed". Every metric is computed
+        regardless, so a rejection still logs a full row for drift monitoring.
         """
         array = self._as_frame(image)
         height, width = array.shape[:2]

@@ -51,7 +51,6 @@ discover from the code.
 from __future__ import annotations
 
 import json
-import logging
 import os
 import threading
 from collections.abc import Mapping, Sequence
@@ -59,6 +58,8 @@ from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
+
+from app.observability.logging_config import get_logger
 
 __all__ = [
     "AUDIT_LOG_PATH",
@@ -68,7 +69,7 @@ __all__ = [
     "record_benchmark",
 ]
 
-logger = logging.getLogger(__name__)
+log = get_logger(__name__)
 
 #: Repo-root-anchored, so the trail lands in the same place whether the server
 #: was started by ``make serve``, a container entrypoint or a test.
@@ -207,22 +208,45 @@ def _append(entry: AuditEntry, path: Path | str | None = None) -> None:
             if is_new:
                 destination.chmod(_FILE_MODE)
     except OSError:
-        logger.exception(
-            "AUDIT WRITE FAILED for %s by %s on %r — the request was served but is NOT in %s.",
-            entry.event,
-            entry.caller,
-            entry.category,
-            destination,
+        # ERROR, with the destination, because this is the failure that leaves a
+        # served request unrecorded — the one thing this module exists to
+        # prevent. `exc_info` carries the OSError (ENOSPC, EROFS, EACCES), which
+        # is the difference between "the disk is full" and "the mount went
+        # read-only" and therefore between two different fixes.
+        log.error(
+            "audit_write_failed",
+            # `audit_event`, not `event`: structlog names a bound logger's first
+            # positional parameter `event`, so passing one as a keyword raises
+            # "got multiple values for argument 'event'". The field is renamed
+            # rather than dropped — which of the audited operations this was is
+            # the point of recording it at all.
+            audit_event=entry.event,
+            caller=entry.caller,
+            role=entry.role,
+            category=entry.category,
+            destination=str(destination),
+            impact="request was served but is NOT in the audit trail",
+            exc_info=True,
         )
     else:
-        logger.info(
-            "Audited %s by %s: category=%r models=%s outcome=%s in %.1fs",
-            entry.event,
-            entry.caller,
-            entry.category,
-            entry.models,
-            entry.outcome,
-            entry.duration_seconds,
+        # `caller` is the hashed identity from app.serving.auth.hash_api_key —
+        # the same value written into the file — so a log line and an audit entry
+        # can be joined on it without either one carrying a usable credential.
+        log.info(
+            "audit_written",
+            # `audit_event`, not `event`: structlog names a bound logger's first
+            # positional parameter `event`, so passing one as a keyword raises
+            # "got multiple values for argument 'event'". The field is renamed
+            # rather than dropped — which of the audited operations this was is
+            # the point of recording it at all.
+            audit_event=entry.event,
+            caller=entry.caller,
+            role=entry.role,
+            category=entry.category,
+            models=entry.models,
+            outcome=entry.outcome,
+            duration_seconds=entry.duration_seconds,
+            destination=str(destination),
         )
 
 
@@ -256,6 +280,6 @@ def get_audit_log(limit: int = DEFAULT_TAIL, *, path: Path | str | None = None) 
             try:
                 entries.append(json.loads(line))
             except json.JSONDecodeError:
-                logger.warning("Skipping unparseable audit line %d in %s.", number, source)
+                log.warning("audit_line_unparseable", line_number=number, source=str(source))
 
     return entries[-limit:]

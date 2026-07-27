@@ -153,7 +153,6 @@ Millisecond-Level Latencies* (WACV 2024), https://arxiv.org/abs/2303.14535
 
 from __future__ import annotations
 
-import logging
 import time
 from collections.abc import Iterator
 from contextlib import contextmanager
@@ -171,10 +170,11 @@ from anomalib.models import EfficientAd
 
 from app.models.base import AnomalyModel, ModelOutput
 from app.models.config import ModelConfig, get_model_config
+from app.observability.logging_config import get_logger
 
 __all__ = ["EfficientADModel"]
 
-logger = logging.getLogger(__name__)
+log = get_logger(__name__)
 
 #: EfficientAD's training step pairs each image with one ImageNette image and
 #: hard-mines the loss over the batch, both of which the paper defines per
@@ -401,7 +401,7 @@ class EfficientADModel(AnomalyModel):
                     f"(expected a checkpoint at {checkpoint})."
                 )
                 raise RuntimeError(msg)
-            logger.info("No model in memory; loading %s", checkpoint)
+            log.info("No model in memory; loading %s", checkpoint)
             self.load(checkpoint)
 
         module = self._module
@@ -469,7 +469,7 @@ class EfficientADModel(AnomalyModel):
             raise TypeError(msg)
 
         if datamodule.category != self.config.category:
-            logger.info(
+            log.info(
                 "Datamodule category %r overrides configured category %r",
                 datamodule.category,
                 self.config.category,
@@ -477,13 +477,13 @@ class EfficientADModel(AnomalyModel):
             self.config = self.config.with_overrides(category=datamodule.category)
 
         if self.config.max_epochs == 1:
-            logger.warning(
+            log.warning(
                 "Training %s for a single epoch. EfficientAD is gradient-trained (the paper uses "
                 "~70k steps); expect a working but under-converged model.",
                 self.model_name,
             )
         if not Path(self.config.imagenet_dir).is_dir():
-            logger.info(
+            log.info(
                 "ImageNette not found at %s; anomalib will download it (~1.5 GB). It is needed "
                 "only to penalise the student for imitating the teacher off-distribution.",
                 self.config.imagenet_dir,
@@ -505,7 +505,7 @@ class EfficientADModel(AnomalyModel):
         self._device = self._module.device
         self._module.eval()
 
-        logger.info(
+        log.info(
             "Fitted %s (%s PDN) on %r in %.1fs over %d epoch(s); quantiles=%s, calibrated=%s",
             self.model_name,
             self.config.model_size,
@@ -516,7 +516,7 @@ class EfficientADModel(AnomalyModel):
             self.is_calibrated,
         )
         if not self.is_calibrated:
-            logger.warning(
+            log.warning(
                 "No validation data was seen during fit, so scores are un-normalized "
                 "student-teacher distances rather than [0, 1].",
             )
@@ -604,7 +604,7 @@ class EfficientADModel(AnomalyModel):
 
         self._checkpoint_path = destination
         size_mb = destination.stat().st_size / 1024**2
-        logger.info("Saved %s checkpoint to %s (%.1f MB)", self.model_name, destination, size_mb)
+        log.info("Saved %s checkpoint to %s (%.1f MB)", self.model_name, destination, size_mb)
 
     def load(self, path: str | Path) -> None:
         """Restore a checkpoint written by :meth:`save` and cache it for inference.
@@ -636,7 +636,7 @@ class EfficientADModel(AnomalyModel):
 
         self._module = module
         self._checkpoint_path = source
-        logger.info(
+        log.info(
             "Loaded %s from %s; model_size=%s, quantiles=%s, calibrated=%s",
             self.model_name,
             source,

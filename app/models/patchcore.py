@@ -79,7 +79,6 @@ Reference: Roth et al., *Towards Total Recall in Industrial Anomaly Detection*
 
 from __future__ import annotations
 
-import logging
 import time
 from pathlib import Path
 from typing import Any
@@ -97,10 +96,11 @@ from anomalib.models import Patchcore
 from app.data.transforms import normalize_image
 from app.models.base import AnomalyModel, ModelOutput
 from app.models.config import ModelConfig, get_model_config
+from app.observability.logging_config import get_logger
 
 __all__ = ["PatchCoreModel"]
 
-logger = logging.getLogger(__name__)
+log = get_logger(__name__)
 
 
 class PatchCoreModel(AnomalyModel):
@@ -263,7 +263,7 @@ class PatchCoreModel(AnomalyModel):
                     f"(expected a checkpoint at {checkpoint})."
                 )
                 raise RuntimeError(msg)
-            logger.info("No model in memory; loading %s", checkpoint)
+            log.info("No model in memory; loading %s", checkpoint)
             self.load(checkpoint)
 
         module = self._module
@@ -300,7 +300,7 @@ class PatchCoreModel(AnomalyModel):
             raise TypeError(msg)
 
         if datamodule.category != self.config.category:
-            logger.info(
+            log.info(
                 "Datamodule category %r overrides configured category %r",
                 datamodule.category,
                 self.config.category,
@@ -308,7 +308,7 @@ class PatchCoreModel(AnomalyModel):
             self.config = self.config.with_overrides(category=datamodule.category)
 
         if self.config.max_epochs != 1:
-            logger.warning(
+            log.warning(
                 "max_epochs=%d requested, but PatchCore is a single-pass memory-bank model; "
                 "anomalib pins training to 1 epoch.",
                 self.config.max_epochs,
@@ -328,7 +328,7 @@ class PatchCoreModel(AnomalyModel):
         self._module.eval()
 
         bank = self._module.model.memory_bank
-        logger.info(
+        log.info(
             "Fitted %s on %r in %.1fs; memory bank %s (coreset ratio %.3f)",
             self.model_name,
             self.category,
@@ -337,7 +337,7 @@ class PatchCoreModel(AnomalyModel):
             self.config.coreset_sampling_ratio,
         )
         if not self.is_calibrated:
-            logger.warning(
+            log.warning(
                 "No validation data was seen during fit, so scores are un-normalized "
                 "nearest-neighbour distances rather than [0, 1].",
             )
@@ -424,7 +424,7 @@ class PatchCoreModel(AnomalyModel):
 
         self._checkpoint_path = destination
         size_mb = destination.stat().st_size / 1024**2
-        logger.info("Saved %s checkpoint to %s (%.1f MB)", self.model_name, destination, size_mb)
+        log.info("Saved %s checkpoint to %s (%.1f MB)", self.model_name, destination, size_mb)
 
     def load(self, path: str | Path) -> None:
         """Restore a checkpoint written by :meth:`save` and cache it for inference.
@@ -455,7 +455,7 @@ class PatchCoreModel(AnomalyModel):
 
         self._module = module
         self._checkpoint_path = source
-        logger.info(
+        log.info(
             "Loaded %s from %s; memory bank %s, calibrated=%s",
             self.model_name,
             source,

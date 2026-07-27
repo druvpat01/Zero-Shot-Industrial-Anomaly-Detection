@@ -27,12 +27,13 @@ metric to trust for industrial segmentation and pixel-AUROC is not.
 
 from __future__ import annotations
 
-import logging
 from collections.abc import Sequence
 
 import numpy as np
 from scipy import ndimage
 from sklearn.metrics import precision_recall_curve, roc_auc_score
+
+from app.observability.logging_config import get_logger
 
 __all__ = [
     "au_pro",
@@ -41,7 +42,7 @@ __all__ = [
     "pixel_auroc",
 ]
 
-logger = logging.getLogger(__name__)
+log = get_logger(__name__)
 
 #: MVTec AD's AU-PRO is, by convention, the area under the PRO/FPR curve
 #: integrated only up to this false-positive rate and then normalized by it.
@@ -89,7 +90,7 @@ def image_auroc(y_true: Sequence[int], scores: Sequence[float]) -> float:
         msg = f"y_true and scores must be the same length, got {y_true.shape} and {scores.shape}."
         raise ValueError(msg)
     if np.unique(y_true).size < 2:
-        logger.warning("image_auroc: only one class present in y_true; ROC-AUC is undefined, returning nan.")
+        log.warning("image_auroc: only one class present in y_true; ROC-AUC is undefined, returning nan.")
         return float("nan")
     return float(roc_auc_score(y_true, scores))
 
@@ -121,7 +122,7 @@ def f1_at_best_threshold(y_true: Sequence[int], scores: Sequence[float]) -> tupl
     y_true = np.asarray(y_true, dtype=int)
     scores = np.asarray(scores, dtype=float)
     if np.unique(y_true).size < 2:
-        logger.warning("f1_at_best_threshold: only one class present in y_true; F1 sweep is undefined.")
+        log.warning("f1_at_best_threshold: only one class present in y_true; F1 sweep is undefined.")
         return (float("nan"), float("nan"))
 
     precision, recall, thresholds = precision_recall_curve(y_true, scores)
@@ -201,7 +202,7 @@ def pixel_auroc(gt_masks: object, pred_maps: object) -> float:
     """
     gt_flat, pred_flat = _stack_pixels(gt_masks, pred_maps)
     if np.unique(gt_flat).size < 2:
-        logger.warning("pixel_auroc: no defect pixels (or no normal pixels) present; returning nan.")
+        log.warning("pixel_auroc: no defect pixels (or no normal pixels) present; returning nan.")
         return float("nan")
     return float(roc_auc_score(gt_flat, pred_flat))
 
@@ -294,7 +295,7 @@ def au_pro(
         total_regions += count
 
     if total_regions == 0:
-        logger.warning("au_pro: no defect regions found in the ground truth; returning nan.")
+        log.warning("au_pro: no defect regions found in the ground truth; returning nan.")
         return float("nan")
 
     normal_mask = ~gt_binary
@@ -303,7 +304,7 @@ def au_pro(
 
     lo, hi = float(pred_stack.min()), float(pred_stack.max())
     if lo == hi:  # a constant heatmap has no ranking to sweep
-        logger.warning("au_pro: heatmaps are constant; returning nan.")
+        log.warning("au_pro: heatmaps are constant; returning nan.")
         return float("nan")
     thresholds = np.linspace(hi, lo, num_thresholds)  # high -> low: FPR sweeps 0 -> 1
 

@@ -23,8 +23,8 @@ The request path, and why it is ordered this way
 
 1. **Decode**, and refuse anything that is not an image (422). Cheapest check,
    and it needs no model.
-2. **Guard**, and refuse a frame not worth scoring (422). Also cheap —
-   microseconds — and, critically, *before* the model is fetched. A blurry frame
+2. **Guard**, and refuse a frame not worth scoring (422). Cheap relative to a
+   forward pass, and, critically, *before* the model is fetched. A blurry frame
    submitted against a backend with no checkpoint returns "blurry", not
    "model_not_ready": the caller's problem is reported ahead of the server's,
    and a cold 30-second model load is never paid for a frame that was going to
@@ -34,11 +34,13 @@ The request path, and why it is ordered this way
 4. **Score**, render the heatmap, and answer.
 
 Step 2 is a deliberate duplicate: every ``AnomalyModel.predict`` runs the same
-guard internally, so the frame is validated twice. That costs about a
-millisecond and it is worth it — running the guard here is what lets the API
-return a *structured* 422 with the failing reason and short-circuit before the
-registry is touched, while the model's own call keeps the guarantee true for
-every caller of the model layer, not just this one.
+guard internally, so the frame is validated twice. The second pass is not free —
+measured at 1.3 ms on a 256x256 frame and 23 ms on a full-resolution 900x900 one,
+because the guard's cost scales with pixel count — but against a forward pass of
+several hundred milliseconds it is worth paying. Running the guard *here* is what
+lets the API return a structured 422 with the failing reason and short-circuit
+before the registry is touched, while the model's own call keeps the guarantee
+true for every caller of the model layer, not just this one.
 
 Errors
 ======
@@ -57,7 +59,7 @@ Anything else                    500     ``{"detail": "internal_error"}``
 ===============================  ======  ====================================================
 
 The 500 is the one that matters for security: the traceback goes to the server
-log via ``logger.exception`` and *only* there. Leaking it to the client would
+log via ``log.error(..., exc_info=True)`` and *only* there. Leaking it to the client would
 hand out filesystem paths, library versions and enough stack detail to fingerprint
 the deployment. The validation handler is overridden for a related reason —
 pydantic's default error payload echoes the offending input back, which for a
@@ -95,14 +97,34 @@ Endpoint         Role        Why
 ran what and what they got, which survives the log-level filtering an application
 log is subject to. ``docs/security.md`` has the reasoning, and is honest about
 what this buys and what it does not.
+
+What a request emits
+====================
+Everything this service reports about itself is set up here and produced on the
+path below. One request produces:
+
+* **Log records**, structured, every one carrying ``request_id`` and
+  ``trace_id`` from :class:`~app.observability.middleware.ObservabilityMiddleware`
+  and — once ``/predict`` knows them — ``model_backend`` and ``category``.
+* **A trace**: a root span per request with ``preprocess``, ``guard``,
+  ``model_load``, ``model_inference`` and ``postprocess`` beneath it.
+* **Metrics**: a counter increment and a latency observation, scraped from
+  ``GET /metrics``.
+
+The three are joined on the same words. A spike on a Grafana panel filters to a
+``model`` and a ``category``; those are the same two field names on the log
+records; those records carry the ``trace_id`` that opens the trace. That
+correspondence is deliberate and it is the only reason three systems are less
+work than one.
 """
 
 from __future__ import annotations
 
-import logging
 import time
+from contextlib import asynccontextmanager
+from typing import AsyncIterator
 
-from fastapi import Depends, FastAPI, Query, Request, status
+from fastapi import Depends, FastAPI, Query, Request, Response, status
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 
@@ -111,6 +133,27 @@ from app.evaluation import BenchmarkRunner
 from app.guardrails import GuardError, guard
 from app.models.base import AnomalyModel
 from app.observability.audit_log import OUTCOME_OK, record_benchmark
+from app.observability.logging_config import bind_log_context, configure_logging, get_logger
+from app.observability.metrics import (
+    CONTENT_TYPE_LATEST,
+    RESULT_DEFECTIVE,
+    RESULT_NORMAL,
+    RESULT_REJECTED,
+    observe_inference,
+    record_image_processed,
+    render_latest,
+)
+from app.observability.middleware import ObservabilityMiddleware
+from app.observability.tracing import (
+    STAGE_GUARD,
+    STAGE_MODEL_INFERENCE,
+    STAGE_MODEL_LOAD,
+    STAGE_POSTPROCESS,
+    STAGE_PREPROCESS,
+    configure_tracing,
+    shutdown_tracing,
+    stage_span,
+)
 from app.serving.auth import Principal, require_operator, require_viewer
 from app.serving.imaging import InvalidImageError, decode_image_b64, encode_heatmap_png_b64
 from app.serving.model_registry import ModelNotReadyError, ModelRegistry, get_registry
@@ -125,13 +168,22 @@ from app.serving.schemas import (
 
 __all__ = ["DatasetNotAvailableError", "app"]
 
-logger = logging.getLogger(__name__)
+log = get_logger(__name__)
 
 #: A model load slower than this gets its own log line. Not an error — a cold
 #: WinCLIP legitimately takes tens of seconds — but it is the single best
 #: explanation for a request that looked inexplicably slow end to end, and
 #: ``latency_ms`` deliberately excludes it.
 _SLOW_LOAD_SECONDS = 1.0
+
+#: Scoring slower than this is logged at WARNING with the measured duration.
+#: Chosen against what the backends actually do on CPU rather than picked round:
+#: an ONNX graph runs in ~30 ms and PatchCore in ~150 ms, so half a second is
+#: comfortably outside normal for those two and something to look at. WinCLIP
+#: exceeds it on every request by design — it is the zero-shot backend, not the
+#: fast one — which is exactly why the warning names the model, and why this is a
+#: WARNING and not an alert.
+_SLOW_INFERENCE_SECONDS = 0.5
 
 #: Starlette renamed ``HTTP_422_UNPROCESSABLE_ENTITY`` to ``..._CONTENT`` (RFC
 #: 9110's wording) and deprecated the old spelling, which would otherwise emit a
@@ -155,6 +207,44 @@ class DatasetNotAvailableError(RuntimeError):
         super().__init__(detail)
 
 
+@asynccontextmanager
+async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
+    """Configure observability once, before the first request, and flush on the way out.
+
+    This is the *only* place :func:`configure_logging` and
+    :func:`configure_tracing` are called on the serving path. Both are
+    idempotent, so a test importing the app after a script already configured
+    logging gets a no-op rather than a second handler on the root logger — but
+    keeping the call in one place is what makes "when does logging start being
+    structured" a question with an answer.
+
+    Startup only touches configuration: no model is loaded here, and that is the
+    contract the whole lazy-loading design in
+    :mod:`app.serving.model_registry` rests on. A container orchestrator gets a
+    ready signal in milliseconds instead of waiting out a 30-second CLIP load and
+    killing the pod for failing its probe.
+
+    Shutdown flushes the tracer. A :class:`~opentelemetry.sdk.trace.export.BatchSpanProcessor`
+    holds spans in a queue, and without an explicit shutdown the last batch is
+    lost on exit — which is precisely the tail of spans around a crash, the ones
+    most worth having.
+    """
+    log_format = configure_logging()
+    exporter = configure_tracing()
+    log.info(
+        "service_starting",
+        service="defect-detection",
+        version="0.1.0",
+        log_format=log_format,
+        trace_exporter=exporter,
+    )
+    try:
+        yield
+    finally:
+        log.info("service_stopping")
+        shutdown_tracing()
+
+
 app = FastAPI(
     title="Zero-Shot Industrial Defect Detection",
     version="0.1.0",
@@ -165,10 +255,17 @@ app = FastAPI(
         "or their exported ONNX graphs. Models load lazily on first use, so "
         "`/health` answers immediately at startup.\n\n"
         "Authenticate with an `X-API-Key` header. `/predict` needs a **viewer** key; "
-        "`/models` and `/benchmark` need an **operator** key; `/health` is open so "
-        "liveness probes work."
+        "`/models` and `/benchmark` need an **operator** key; `/health` and `/metrics` "
+        "are open so liveness probes and Prometheus scrapes work."
     ),
+    lifespan=lifespan,
 )
+
+#: Outermost application middleware: every request gets an id, a root span and a
+#: log context before any handler or exception handler runs. Registered here
+#: rather than per-route because its whole value is that nothing escapes it —
+#: including the 404s and 500s that no route produced.
+app.add_middleware(ObservabilityMiddleware)
 
 
 # ---------------------------------------------------------------------------
@@ -179,7 +276,7 @@ app = FastAPI(
 @app.exception_handler(InvalidImageError)
 def _handle_invalid_image(request: Request, exc: InvalidImageError) -> JSONResponse:
     """422: ``image_b64`` was not a decodable image."""
-    logger.info("Rejected %s: invalid image (%s)", request.url.path, exc.reason)
+    log.info("request_rejected", detail="invalid_image", path=request.url.path, reason=exc.reason)
     return JSONResponse(
         status_code=_HTTP_422,
         content={"detail": "invalid_image", "reason": exc.reason},
@@ -190,13 +287,23 @@ def _handle_invalid_image(request: Request, exc: InvalidImageError) -> JSONRespo
 def _handle_guard_error(request: Request, exc: GuardError) -> JSONResponse:
     """422: the frame decoded fine but is not worth scoring.
 
-    The guard's metrics go to the log rather than the response. They are drift-
-    monitoring telemetry — watching ``laplacian_variance`` sag over a shift is
-    how a fouling lens is caught before it starts rejecting frames — and that is
-    a server-side concern, not something the caller of a single request can act
-    on beyond the ``reason``.
+    Translation only — the ``guard_rejected`` record is emitted by the caller
+    that raised, not here, and that split is worth explaining because the obvious
+    arrangement is the broken one.
+
+    This app's handlers are synchronous, so Starlette runs them in a thread pool.
+    A :class:`~contextvars.ContextVar` bound *inside* that worker — which is
+    where ``/predict`` binds ``model_backend`` and ``category`` — propagates
+    downward but not back out: by the time an exception has unwound to this
+    handler, execution is on the event loop again and those bindings are gone. A
+    log line written here would therefore be missing exactly the two fields that
+    make a rejection attributable, and would be missing them *silently*.
+
+    So the rejection is logged where the context is live: in :func:`predict` for
+    the API path, in :meth:`app.models.base.AnomalyModel._check_frame` for every
+    other caller of the model layer. Between them every raise site is covered,
+    and no frame is logged twice.
     """
-    logger.warning("Rejected %s: guard_failed reason=%s metrics=%s", request.url.path, exc.reason, exc.metrics)
     return JSONResponse(
         status_code=_HTTP_422,
         content={"detail": "guard_failed", "reason": exc.reason},
@@ -206,7 +313,14 @@ def _handle_guard_error(request: Request, exc: GuardError) -> JSONResponse:
 @app.exception_handler(ModelNotReadyError)
 def _handle_model_not_ready(request: Request, exc: ModelNotReadyError) -> JSONResponse:
     """503: the backend has no artifact that can serve this category."""
-    logger.error("Rejected %s: model_not_ready backend=%s (%s)", request.url.path, exc.backend, exc.detail)
+    log.error(
+        "request_rejected",
+        detail="model_not_ready",
+        path=request.url.path,
+        backend=exc.backend,
+        category=exc.category,
+        reason=exc.detail,
+    )
     return JSONResponse(
         status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
         content={"detail": "model_not_ready", "backend": exc.backend, "reason": exc.detail},
@@ -216,7 +330,13 @@ def _handle_model_not_ready(request: Request, exc: ModelNotReadyError) -> JSONRe
 @app.exception_handler(DatasetNotAvailableError)
 def _handle_dataset_not_available(request: Request, exc: DatasetNotAvailableError) -> JSONResponse:
     """503: the benchmark was asked for a category whose test split is not present."""
-    logger.error("Rejected %s: dataset_not_available category=%s", request.url.path, exc.category)
+    log.error(
+        "request_rejected",
+        detail="dataset_not_available",
+        path=request.url.path,
+        category=exc.category,
+        reason=exc.detail,
+    )
     return JSONResponse(
         status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
         content={"detail": "dataset_not_available", "category": exc.category, "reason": exc.detail},
@@ -238,7 +358,7 @@ def _handle_validation_error(request: Request, exc: RequestValidationError) -> J
         {"loc": [str(part) for part in error.get("loc", ())], "msg": error.get("msg", ""), "type": error.get("type", "")}
         for error in exc.errors()
     ]
-    logger.info("Rejected %s: invalid_request %s", request.url.path, errors)
+    log.info("request_rejected", detail="invalid_request", path=request.url.path, errors=errors)
     return JSONResponse(
         status_code=_HTTP_422,
         content={"detail": "invalid_request", "errors": errors},
@@ -250,9 +370,19 @@ def _handle_unexpected(request: Request, exc: Exception) -> JSONResponse:
     """500: anything not accounted for above.
 
     The traceback goes to the log and nowhere else — see the module docstring.
-    The client gets a slug and nothing to fingerprint the deployment with.
+    The client gets a slug and nothing to fingerprint the deployment with. It
+    also gets an ``X-Request-Id`` header from the middleware, which is the whole
+    point of the id: a caller reporting "my request failed" hands over an opaque
+    string that finds the traceback, without the traceback ever being sent to
+    them.
     """
-    logger.exception("Unhandled error serving %s: %s", request.url.path, type(exc).__name__)
+    log.error(
+        "request_failed",
+        detail="internal_error",
+        path=request.url.path,
+        error=type(exc).__name__,
+        exc_info=True,
+    )
     return JSONResponse(
         status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
         content={"detail": "internal_error"},
@@ -284,6 +414,33 @@ def health(registry: ModelRegistry = Depends(get_registry)) -> HealthResponse:
     return HealthResponse(status="ok", models_loaded=registry.loaded_keys())
 
 
+@app.get("/metrics", tags=["ops"], include_in_schema=False)
+def metrics() -> Response:
+    """Prometheus scrape target. Unauthenticated, like ``/health``.
+
+    Returns the text exposition format described in
+    :mod:`app.observability.metrics`, with the content type prometheus_client
+    declares — the version parameter in it is content-negotiated by the scraper,
+    so it is re-exported rather than hardcoded.
+
+    **Open on purpose, and worth being explicit about what that discloses.** A
+    Prometheus server scrapes on a schedule and holds no credential; giving it
+    one means a secret in the scrape config of every environment, which is a
+    worse problem than the one it solves. What an anonymous caller learns from
+    this endpoint is real but bounded: request volume, the defect rate, which
+    categories and backends are configured, and the process's memory. That is
+    strictly more than ``/health`` gives away and strictly less than ``/models``,
+    which is why ``/models`` is gated and this is not. In a deployment the
+    correct control is a network one — bind the metrics port to the cluster's
+    internal network, or scrape through a sidecar — and ``docs/security.md``
+    says so rather than pretending the endpoint is harmless.
+
+    Excluded from the OpenAPI schema: it is not part of the API's contract with
+    an inspection line, and its response is not JSON.
+    """
+    return Response(content=render_latest(), media_type=CONTENT_TYPE_LATEST)
+
+
 @app.get("/models", response_model=list[ModelInfo], tags=["ops"])
 def list_models(
     category: str | None = Query(
@@ -308,7 +465,7 @@ def list_models(
     anyone probing it. That is an operator's business, not a viewer's.
     """
     resolved = category or registry.config.category
-    logger.debug("Listing models for %r (requested by %s)", resolved, principal)
+    log.debug("models_listed", category=resolved, caller=principal.key_id, role=principal.role)
     return [ModelInfo(**row) for row in registry.describe(resolved)]
 
 
@@ -346,47 +503,130 @@ def predict(
     """
     started = time.perf_counter()
 
-    frame = decode_image_b64(request.image_b64)
+    # Bound before anything can fail, so every record emitted from here to the
+    # end of this function is attributable to a model and a category. These are
+    # the same two words as the `model` and `category` labels in
+    # app.observability.metrics, on purpose: a spike on a dashboard and the log
+    # lines explaining it are then selected with the same query terms.
+    #
+    # The binding reaches everything this handler calls, but *not* the exception
+    # handlers above — this runs in Starlette's thread pool and a contextvar set
+    # here does not survive the unwind back to the event loop. That is why the
+    # rejection below is logged here rather than there.
+    bind_log_context(model_backend=request.model_backend, category=request.category)
 
-    verdict = guard.validate(frame)
+    with stage_span(STAGE_PREPROCESS, payload_chars=len(request.image_b64)) as span:
+        frame = decode_image_b64(request.image_b64)
+        span.set_attribute("frame.height", int(frame.shape[0]))
+        span.set_attribute("frame.width", int(frame.shape[1]))
+
+    with stage_span(STAGE_GUARD) as span:
+        # FrameGuard times itself into guard_check_latency_seconds and counts its
+        # own rejections — see app.guardrails.quality. This span adds the
+        # per-request view of the same event, and the reason as an attribute so a
+        # trace search can find every rejected frame.
+        verdict = guard.validate(frame)
+        span.set_attribute("guard.passed", verdict.passed)
+        if verdict.reason is not None:
+            span.set_attribute("guard.reason", verdict.reason)
+
     if not verdict.passed:
+        # Both the count and the log line happen here rather than in the
+        # exception handler, and for the same reason: this is the last point that
+        # still has the request's log context and both labels. See
+        # `_handle_guard_error` for why the handler cannot have them.
+        #
+        # The requested backend is used, not a resolved model name: no model ran,
+        # and inventing one would put a fictitious row in the model breakdown.
+        record_image_processed(
+            model=request.model_backend,
+            category=request.category,
+            result=RESULT_REJECTED,
+        )
+        # The guard's metrics are spread as top-level fields rather than nested
+        # under a `metrics` key, so a log backend can aggregate and alert on
+        # `laplacian_variance` as a number instead of parsing it out of a blob.
+        # They are drift-monitoring telemetry and stay server-side: watching that
+        # value sag across a shift is how a fouling lens is caught *before* it
+        # starts rejecting frames, which is not something the caller of a single
+        # request can act on beyond the `reason` they are already given.
+        log.warning("guard_rejected", reason=verdict.reason, source="api", **verdict.metrics)
         raise GuardError(verdict)
 
     # Timed separately and subtracted below: a cold load is a one-off startup
     # cost, and folding it into the reported latency would put a 30-second
     # outlier in the same series as the 150 ms steady state, ruining every
-    # percentile computed from it. (Step 10 observes the two as separate
-    # Prometheus metrics for the same reason; this is where the histogram
-    # observation for `latency_ms` will go.)
+    # percentile computed from it. It gets its own span for the same reason.
     load_started = time.perf_counter()
-    model = registry.get_model(request.model_backend, request.category)
+    with stage_span(STAGE_MODEL_LOAD, backend=request.model_backend, category=request.category) as span:
+        model = registry.get_model(request.model_backend, request.category)
+        span.set_attribute("model_name", model.model_name)
+        # False on all but the first request for a backend. Recorded so a trace
+        # showing an anomalous duration can be dismissed in one glance.
+        span.set_attribute("cold_load", time.perf_counter() - load_started > _SLOW_LOAD_SECONDS)
     load_elapsed = time.perf_counter() - load_started
     if load_elapsed > _SLOW_LOAD_SECONDS:
-        logger.info(
-            "Cold-loaded %r for %r in %.1fs; this is excluded from the reported latency.",
-            request.model_backend,
-            request.category,
-            load_elapsed,
+        log.info(
+            "model_cold_loaded",
+            backend=request.model_backend,
+            model_name=model.model_name,
+            duration_seconds=round(load_elapsed, 3),
+            note="excluded from the reported latency",
         )
 
-    # BGR because decode_image_b64 hands back OpenCV's channel order. Passing
-    # the default "rgb" here would swap the channels under an ImageNet- or
-    # CLIP-pretrained backbone: no error, no shape change, quietly worse scores.
-    output = model.predict(frame, color_order="bgr")
-    heatmap_b64 = encode_heatmap_png_b64(output.anomaly_map, calibrated=model.is_calibrated)
+    with stage_span(STAGE_MODEL_INFERENCE, model_name=model.model_name) as span:
+        inference_started = time.perf_counter()
+        # BGR because decode_image_b64 hands back OpenCV's channel order. Passing
+        # the default "rgb" here would swap the channels under an ImageNet- or
+        # CLIP-pretrained backbone: no error, no shape change, quietly worse scores.
+        output = model.predict(frame, color_order="bgr")
+        inference_elapsed = time.perf_counter() - inference_started
+        span.set_attribute("anomaly_score", float(output.anomaly_score))
+        span.set_attribute("is_defective", bool(output.is_defective))
+
+    # The forward pass alone, excluding decode and heatmap encoding — the two
+    # ends of the request that scale with the payload rather than with the model.
+    # A histogram that mixed them could not answer "did the model get slower",
+    # which is the only question it is asked.
+    observe_inference(model=output.model_name, seconds=inference_elapsed)
+
+    if inference_elapsed > _SLOW_INFERENCE_SECONDS:
+        log.warning(
+            "slow_inference",
+            model_name=output.model_name,
+            duration_seconds=round(inference_elapsed, 3),
+            threshold_seconds=_SLOW_INFERENCE_SECONDS,
+            frame_height=int(frame.shape[0]),
+            frame_width=int(frame.shape[1]),
+        )
+
+    with stage_span(STAGE_POSTPROCESS, calibrated=model.is_calibrated):
+        heatmap_b64 = encode_heatmap_png_b64(output.anomaly_map, calibrated=model.is_calibrated)
 
     latency_ms = (time.perf_counter() - started - load_elapsed) * 1000.0
+
+    # Attributed to the *resolved* model name, so an ONNX fallback is counted as
+    # `onnx_patchcore`. The requested backend is what the caller asked for; this
+    # is what actually scored the frame, and a defect rate attributed to the
+    # wrong one is worse than no defect rate.
+    record_image_processed(
+        model=output.model_name,
+        category=request.category,
+        result=RESULT_DEFECTIVE if output.is_defective else RESULT_NORMAL,
+    )
+
     # The caller's hashed identity, not their key — see app.serving.auth.
     # /predict is high-volume, so it gets a log line rather than an audit entry;
     # the audit trail is reserved for the expensive, privacy-relevant call.
-    logger.info(
-        "Scored %s/%s for %s: score=%.4f defective=%s in %.1fms",
-        request.model_backend,
-        request.category,
-        principal,
-        output.anomaly_score,
-        output.is_defective,
-        latency_ms,
+    log.info(
+        "frame_scored",
+        model_name=output.model_name,
+        caller=principal.key_id,
+        role=principal.role,
+        anomaly_score=round(float(output.anomaly_score), 4),
+        is_defective=bool(output.is_defective),
+        latency_ms=round(latency_ms, 2),
+        inference_seconds=round(inference_elapsed, 4),
     )
 
     return InferenceResponse(
@@ -494,10 +734,11 @@ def _run_benchmark(request: BenchmarkRequest, registry: ModelRegistry) -> dict[s
             # keys results by model_name and rejects duplicates, so collapse
             # them here — running the identical graph twice would produce two
             # identical rows at twice the cost.
-            logger.warning(
-                "Backend %r resolved to %r, which is already in this run; scoring it once.",
-                backend,
-                model.model_name,
+            log.warning(
+                "benchmark_backend_collapsed",
+                backend=backend,
+                model_name=model.model_name,
+                reason="already in this run; scoring it once",
             )
             continue
         models[model.model_name] = model
@@ -515,13 +756,19 @@ def _run_benchmark(request: BenchmarkRequest, registry: ModelRegistry) -> dict[s
     except FileNotFoundError as exc:
         raise DatasetNotAvailableError(request.category, str(exc)) from exc
 
-    logger.info(
-        "Benchmarking %s on %r (this is slow by design; see the endpoint docstring)",
-        list(models),
-        request.category,
+    log.info(
+        "benchmark_started",
+        models=list(models),
+        category=request.category,
+        note="slow by design; see the endpoint docstring",
     )
     started = time.perf_counter()
     results = BenchmarkRunner(list(models.values()), datamodule, results_dir=config.results_dir).run()
-    logger.info("Benchmark of %r finished in %.1fs", request.category, time.perf_counter() - started)
+    log.info(
+        "benchmark_finished",
+        models=list(models),
+        category=request.category,
+        duration_seconds=round(time.perf_counter() - started, 3),
+    )
 
     return results

@@ -30,8 +30,11 @@ import torch.nn.functional as F  # noqa: N812 - conventional alias
 from app.data.transforms import to_tensor
 from app.guardrails import GuardError, GuardResult, guard
 from app.models.config import ModelConfig
+from app.observability.logging_config import get_logger
 
 __all__ = ["AnomalyModel", "ModelOutput"]
+
+log = get_logger(__name__)
 
 #: A float image already scaled to [0, 1] never exceeds this; anything above it
 #: is a float array still on the 0-255 scale, which we rescale rather than reject.
@@ -217,6 +220,22 @@ class AnomalyModel(ABC):
         """
         verdict = guard.validate(frame)
         if not verdict.passed:
+            # The one log line covering *every* caller of the model layer — a
+            # script, a notebook, a benchmark run — not just the API. The API
+            # path rejects in its own handler before a model is ever fetched, so
+            # these two never fire for the same frame.
+            #
+            # The guard's metrics are spread into the record rather than nested
+            # under a `metrics` key: `laplacian_variance` as a top-level field is
+            # a number a log backend will aggregate and alert on, whereas the
+            # same value inside a JSON blob is a string somebody has to parse.
+            log.warning(
+                "guard_rejected",
+                reason=verdict.reason,
+                model_backend=self.model_name,
+                source="model",
+                **verdict.metrics,
+            )
             raise GuardError(verdict)
         return verdict
 

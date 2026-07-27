@@ -40,7 +40,6 @@ disagree).
 
 from __future__ import annotations
 
-import logging
 from pathlib import Path
 from typing import Any
 
@@ -50,10 +49,11 @@ import torch
 
 from app.models.base import AnomalyModel, ModelOutput
 from app.models.config import ModelConfig, get_model_config
+from app.observability.logging_config import get_logger
 
 __all__ = ["DEFAULT_EXPORTED_DIR", "ONNXRunner", "onnx_artifact_path"]
 
-logger = logging.getLogger(__name__)
+log = get_logger(__name__)
 
 # Repo-root-anchored so the default export location resolves the same from a
 # script, a test or the API server, whatever the working directory is.
@@ -178,12 +178,13 @@ class ONNXRunner(AnomalyModel):
         self.model_name = model_name or self._path.stem
         self._reconcile_input_size()
 
-        logger.info(
-            "Loaded ONNX model %s as %r (input %s, providers=%s)",
-            self._path,
-            self.model_name,
-            "x".join(str(d) for d in self.config.image_hw),
-            self._session.get_providers(),
+        log.info(
+            "model_checkpoint_loaded",
+            backend="onnx",
+            model_name=self.model_name,
+            checkpoint=str(self._path),
+            input_size="x".join(str(d) for d in self.config.image_hw),
+            providers=self._session.get_providers(),
         )
 
     # -- introspection ---------------------------------------------------------
@@ -303,7 +304,7 @@ class ONNXRunner(AnomalyModel):
         if not (isinstance(height, int) and isinstance(width, int) and height == width > 0):
             return
         if height != self.config.image_size:
-            logger.warning(
+            log.warning(
                 "ONNX graph %s expects %dx%d input; overriding config image_size=%d to match.",
                 self._path.name,
                 height,
