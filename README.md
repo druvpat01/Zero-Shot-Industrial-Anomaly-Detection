@@ -17,7 +17,8 @@ _Placeholder — to be filled in as components land._
 
 - **Data** — dataset download, preprocessing, and datamodule wrappers.
 - **Models** — PatchCore, EfficientAD, and WinCLIP wrappers behind a common interface.
-- **Evaluation** — AUROC, AU-PRO, and F1 metrics with a benchmark runner.
+- **Evaluation** — AUROC, AU-PRO, and F1 metrics with a benchmark runner, plus
+  score-distribution drift detection and threshold calibration.
 - **Guardrails** — input frame quality validation before inference.
 - **Serving** — FastAPI routes, schemas, and session management.
 - **Observability** — structured logging, Prometheus metrics, and tracing.
@@ -40,12 +41,53 @@ make serve
 
 Copy `.env.example` to `.env` and adjust configuration as needed.
 
-`.env` is also where API keys live. `/predict`, `/models` and `/benchmark` are
-gated by an `X-API-Key` header, and a server with no keys configured refuses all
-three with `503 auth_not_configured` — set `VIEWER_API_KEYS` and
-`OPERATOR_API_KEYS` before `make serve`. `/health` stays open for liveness
-probes. [`docs/security.md`](docs/security.md) explains what is gated, what is
-audited, and what production would still require.
+`.env` is also where API keys live. Every endpoint except `/health` is gated by
+an `X-API-Key` header, and a server with no keys configured refuses them all with
+`503 auth_not_configured` — set `VIEWER_API_KEYS` and `OPERATOR_API_KEYS` before
+`make serve`. `/health` stays open for liveness probes.
+[`docs/security.md`](docs/security.md) explains what is gated, what is audited,
+and what production would still require.
+
+## Reliability: drift and the operating point
+
+The guardrails catch a bad *frame*. Nothing about a bad *score* is structurally
+wrong — the model returns a well-formed float that simply no longer means what it
+meant when the threshold was chosen, because the product line changed, the camera
+aged, or something was deployed. `/health` stays green throughout.
+
+[`app/evaluation/drift.py`](app/evaluation/drift.py) watches for it. Every
+`/predict` feeds its score into a rolling window per `(model, category)`;
+`GET /drift` compares that window against a reference distribution with a
+two-sample Kolmogorov-Smirnov test — the right test here precisely because it
+assumes nothing about the shape of the data, and anomaly scores are skewed,
+bounded and usually bimodal. Below `KS_DRIFT_THRESHOLD` (default `0.05`) it
+reports `ks_drift`, alongside the window's mean/std/p10/p50/p90 so an operator
+can tell a shift that matters from one that is merely significant.
+
+The usual fix is not a retrain but a new operating point.
+[`app/evaluation/calibration.py`](app/evaluation/calibration.py) sweeps every
+threshold a labelled score set can produce and returns the one maximising F1 (or
+precision, recall, balanced accuracy); `POST /calibrate` installs it in memory and
+— by default — installs the same scores as the drift reference, because the
+calibration set *is* the new definition of normal.
+
+```bash
+# Fit an operating point from held-out labelled scores, and set the baseline
+curl -s -X POST localhost:8000/calibrate -H "X-API-Key: $OPERATOR_KEY" \
+  -H 'Content-Type: application/json' \
+  -d '{"category":"bottle","model_backend":"patchcore","metric":"f1",
+       "samples":[{"score":0.11,"label":0},{"score":0.94,"label":1}]}'
+
+# Then watch what the line is actually producing
+curl -s localhost:8000/drift -H "X-API-Key: $OPERATOR_KEY" | python -m json.tool
+```
+
+Both endpoints are operator-only, and `/calibrate` is audited: it is the only
+call that changes how the service grades parts. The change is in-memory and
+per-worker, so a threshold worth keeping belongs in `ANOMALY_THRESHOLD` —
+[`docs/evaluation.md`](docs/evaluation.md) has the full argument, including why
+`p < 0.05` buys a 5% false-alarm rate by construction and what a production
+system should do at each rung of the response ladder.
 
 ## Observability
 

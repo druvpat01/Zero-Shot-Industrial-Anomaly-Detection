@@ -48,6 +48,7 @@ from app.observability.audit_log import (
     AuditEntry,
     get_audit_log,
     record_benchmark,
+    record_calibration,
 )
 from app.observability.logging_config import (
     bind_log_context,
@@ -98,6 +99,7 @@ __all__ = [
     "get_logger",
     "observe_inference",
     "record_benchmark",
+    "record_calibration",
     "record_guard_rejection",
     "record_image_processed",
     "render_latest",

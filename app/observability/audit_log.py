@@ -17,14 +17,31 @@ than for elegance — a truncated write damages one line instead of invalidating
 the document (as it would for a top-level JSON array), ``tail -f`` works, ``wc -l``
 counts events, and ``jq`` reads it without loading the history into memory.
 
+What is audited
+===============
+Two operations, distinguished by the ``event`` field:
+
+* ``benchmark`` — the *expensive, privacy-relevant read*. Minutes of CPU per
+  call, and a response describing the customer's test data.
+* ``calibration`` — the *cheap, consequential write*. ``POST /calibrate`` moves
+  the threshold at which the service calls a part defective, for every
+  subsequent request from every caller, until the process restarts. It costs
+  milliseconds and cannot leak a dataset, so neither of the arguments for
+  auditing ``/benchmark`` applies; it is audited for the opposite reason. When
+  someone asks in three weeks why the scrap rate stepped on a Tuesday, the
+  answer is one line of this file, and the application log that would otherwise
+  hold it has long since rotated. A change to how a machine grades parts should
+  outlive the debugging of it.
+
 What is recorded, and the two things that are not
 =================================================
 Each entry carries the timestamp, the *hashed* caller identity and role, the
-requested category and backends, how long the run took, and the metrics the
-caller received. That last field is the point: an audit trail that says "someone
-ran a benchmark" is nearly useless, whereas one that says "this key obtained
-these numbers over this category's test split" answers the question an incident
-review actually asks.
+requested category and backends, how long the operation took, and the ``metrics``
+the caller received — for a benchmark, its results; for a calibration, the old
+and new thresholds and what the new one achieves. That last field is the point:
+an audit trail that says "someone ran a benchmark" is nearly useless, whereas one
+that says "this key obtained these numbers over this category's test split"
+answers the question an incident review actually asks.
 
 Two omissions are deliberate:
 
@@ -67,6 +84,7 @@ __all__ = [
     "AuditEntry",
     "get_audit_log",
     "record_benchmark",
+    "record_calibration",
 ]
 
 log = get_logger(__name__)
@@ -105,8 +123,10 @@ class AuditEntry:
         timestamp: UTC ISO-8601, second resolution, with an explicit offset.
             Naive local timestamps are how an audit trail becomes unusable the
             first time it is read on a machine in another timezone.
-        event: What happened. ``"benchmark"`` today; the field exists so a second
-            audited operation does not need a second file or a schema migration.
+        event: What happened — ``"benchmark"`` or ``"calibration"``. The field is
+            why a second audited operation needed neither a second file nor a
+            schema migration; ``metrics`` carries whatever that operation's
+            payload happens to be.
         caller: Hashed key identity from :func:`app.serving.auth.hash_api_key`.
         role: The role that key holds, so a privilege escalation is visible in
             the trail itself rather than only by cross-referencing the config.
@@ -185,6 +205,57 @@ def record_benchmark(
         role=role,
         category=category,
         models=list(models),
+        duration_seconds=round(float(duration_seconds), 3),
+        outcome=outcome,
+        metrics=dict(metrics or {}),
+    )
+    _append(entry, path)
+    return entry
+
+
+def record_calibration(
+    *,
+    caller: str,
+    role: str,
+    category: str,
+    model_name: str,
+    duration_seconds: float,
+    metrics: Mapping[str, Any] | None = None,
+    outcome: str = OUTCOME_OK,
+    path: Path | str | None = None,
+) -> AuditEntry:
+    """Append one ``calibration`` entry: who moved the decision threshold, and to what.
+
+    Uses the same :class:`AuditEntry` shape as :func:`record_benchmark` rather
+    than a variant, which is what the ``event`` field was for. ``models`` holds
+    the single model that was updated, and ``metrics`` holds the change —
+    ``threshold``, ``previous_threshold``, the metric maximised and what it
+    achieves — so one line answers "what was it before, what is it now, and on
+    what evidence".
+
+    Args:
+        caller: Hashed key identity — :attr:`app.serving.auth.Principal.key_id`.
+        role: The caller's role.
+        category: Category whose threshold was calibrated.
+        model_name: The resolved model that was updated.
+        duration_seconds: Wall-clock duration of the request.
+        metrics: The change, as returned to the caller.
+        outcome: :data:`OUTCOME_OK`, or ``"failed:<ExceptionType>"``. A failed
+            calibration is recorded too: a rejected calibration set is an
+            operator trying to move the threshold and being refused, which is
+            exactly as worth knowing as a successful one.
+        path: Destination file. Defaults to :data:`AUDIT_LOG_PATH`.
+
+    Returns:
+        The :class:`AuditEntry` that was written.
+    """
+    entry = AuditEntry(
+        timestamp=datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        event="calibration",
+        caller=caller,
+        role=role,
+        category=category,
+        models=[model_name],
         duration_seconds=round(float(duration_seconds), 3),
         outcome=outcome,
         metrics=dict(metrics or {}),

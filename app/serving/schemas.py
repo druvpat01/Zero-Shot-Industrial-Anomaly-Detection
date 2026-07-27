@@ -29,9 +29,15 @@ from typing import Literal, get_args
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 __all__ = [
+    "CALIBRATION_METRICS",
     "MODEL_BACKENDS",
     "BenchmarkRequest",
     "BenchmarkResponse",
+    "CalibrationMetric",
+    "CalibrationRequest",
+    "CalibrationResponse",
+    "CalibrationSample",
+    "DriftStatus",
     "HealthResponse",
     "InferenceRequest",
     "InferenceResponse",
@@ -56,6 +62,21 @@ ModelBackend = Literal[
 #: The same names as a tuple, for runtime checks and error messages. Derived from
 #: the ``Literal`` rather than repeated, so the two cannot drift apart.
 MODEL_BACKENDS: tuple[str, ...] = get_args(ModelBackend)
+
+#: What ``POST /calibrate`` may be asked to maximise. Mirrors
+#: :data:`app.evaluation.calibration.CALIBRATION_METRICS` — spelled out here
+#: rather than imported, so the wire contract stays readable without following an
+#: import, and pinned to the implementation by a test in ``tests/test_drift.py``
+#: so the two cannot drift apart unnoticed.
+CalibrationMetric = Literal[
+    "f1",
+    "precision",
+    "recall",
+    "balanced_accuracy",
+]
+
+#: The same names as a tuple, derived from the ``Literal``.
+CALIBRATION_METRICS: tuple[str, ...] = get_args(CalibrationMetric)
 
 
 class InferenceRequest(BaseModel):
@@ -220,4 +241,163 @@ class ModelInfo(BaseModel):
         default=None,
         description="Why the backend is unavailable, or how it would be served (e.g. an "
         "ONNX fallback). Null when there is nothing to explain.",
+    )
+
+
+class DriftStatus(BaseModel):
+    """One model's score-distribution health, as reported by ``GET /drift``.
+
+    Read ``drifted`` and ``summary`` together, never separately. ``drifted`` is a
+    hypothesis test and answers only *did the distribution move*; the percentiles
+    answer *by how much*, and with a large enough window the test will eventually
+    flag a shift far too small to change a single verdict. See
+    :mod:`app.evaluation.drift`.
+
+    ``drifted=false`` with ``p_value=null`` is a third state and not a clean bill
+    of health: it means no verdict was available, because no reference has been
+    set or a window is still filling.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    model_name: str = Field(
+        description="The resolved model whose scores these are — an ONNX fallback is "
+        "monitored separately from the PyTorch backend it stood in for.",
+        examples=["patchcore"],
+    )
+    category: str = Field(description="The category these scores were produced for.", examples=["bottle"])
+    drifted: bool = Field(
+        description="Whether the KS p-value fell below `threshold`. False also when there "
+        "is not yet enough data to say — check `p_value` for null to tell them apart.",
+    )
+    reason: str | None = Field(
+        default=None,
+        description="'ks_drift' when drift was detected, else null.",
+        examples=["ks_drift"],
+    )
+    p_value: float | None = Field(
+        default=None,
+        description="Two-sample Kolmogorov-Smirnov p-value against the reference window. "
+        "Null when no verdict is available: no reference set, or a window below the "
+        "minimum sample count.",
+        examples=[0.42],
+    )
+    threshold: float = Field(
+        description="p-value at or below which drift is declared. From KS_DRIFT_THRESHOLD.",
+        examples=[0.05],
+    )
+    window_size: int = Field(description="Capacity of the rolling window.", examples=[500])
+    reference_size: int = Field(
+        description="Scores in the reference distribution. Zero until POST /calibrate or an "
+        "explicit set_reference call establishes one.",
+        examples=[100],
+    )
+    min_samples: int = Field(
+        description="Scores each window needs before a verdict is offered. Reported so a null "
+        "`p_value` is explicable from the response alone: compare it against `reference_size` "
+        "and `summary.count` to see which window is still filling.",
+        examples=[30],
+    )
+    # The `int` member looks redundant next to `float` — PEP 484 already accepts an
+    # int wherever a float is declared — but it is load-bearing here. Without it
+    # pydantic coerces `count` to a float and the response reads `"count": 20.0`,
+    # which is a sample size rendered as a measurement. Smart-union mode matches
+    # the exact type, so `20` stays `20` and `1.0` stays `1.0`.
+    summary: dict[str, float | int | None] = Field(
+        description="Descriptive statistics for the current window: count, mean, std, p10, "
+        "p50, p90. The five statistics are null on an empty window. Left as an open dict "
+        "rather than a typed model so a new statistic reaches the API the moment it reaches "
+        "the monitor, matching BenchmarkResponse.",
+        examples=[{"count": 20, "mean": 0.31, "std": 0.12, "p10": 0.18, "p50": 0.28, "p90": 0.52}],
+    )
+
+
+class CalibrationSample(BaseModel):
+    """One labelled point in a calibration set: what the model said, and the truth."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    score: float = Field(
+        description="The anomaly score this frame received, as returned by /predict.",
+        examples=[0.83],
+    )
+    label: int = Field(
+        description="Ground truth: 1 defective, 0 normal.",
+        examples=[1],
+        ge=0,
+        le=1,
+    )
+
+
+class CalibrationRequest(BaseModel):
+    """A labelled score set, and the model whose operating point it should fit."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    category: str = Field(
+        description="Category whose threshold is being calibrated.",
+        examples=["bottle"],
+        min_length=1,
+    )
+    model_backend: ModelBackend = Field(
+        description="Backend whose decision threshold is updated.",
+        examples=["patchcore"],
+    )
+    samples: list[CalibrationSample] = Field(
+        description="The calibration set: scores this model produced, with ground-truth "
+        "labels. Must contain both classes — a threshold fitted to one class is not an "
+        "operating point. Held out from training, or the fitted threshold is optimistic.",
+        min_length=2,
+    )
+    metric: CalibrationMetric = Field(
+        default="f1",
+        description=f"What to maximise. One of {list(CALIBRATION_METRICS)}. 'f1' balances "
+        "false alarms against missed defects; 'precision' and 'recall' alone are degenerate "
+        "at the extremes — see app.evaluation.calibration.",
+        examples=["f1"],
+    )
+    set_drift_reference: bool = Field(
+        default=True,
+        description="Also install these scores as the drift monitor's reference distribution. "
+        "On by default because the calibration set *is* the new definition of normal: the "
+        "threshold and the baseline it was fitted against should move together.",
+    )
+
+
+class CalibrationResponse(BaseModel):
+    """The fitted operating point, and what it achieves on the submitted set.
+
+    ``metric_value`` is the number that decides whether the calibration was worth
+    applying. A best-achievable F1 of 0.42 is still the best available, and still
+    says the model cannot be rescued by moving its threshold.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    model_name: str = Field(
+        description="The model that was updated. Not always the requested backend: an ONNX "
+        "fallback is calibrated under its own name.",
+        examples=["patchcore"],
+    )
+    category: str = Field(description="The category that was calibrated.", examples=["bottle"])
+    metric: str = Field(description="The metric that was maximised.", examples=["f1"])
+    threshold: float = Field(
+        description="The new decision threshold. A frame is defective when score >= this.",
+        examples=[0.42],
+    )
+    previous_threshold: float = Field(
+        description="The threshold this replaced, so the change is visible in one response.",
+        examples=[0.5],
+    )
+    metric_value: float = Field(
+        description="What `metric` achieves at `threshold` on the submitted set. Fitted on "
+        "this data, so it is an upper bound on production performance, not an estimate of it.",
+        examples=[0.94],
+    )
+    samples: int = Field(description="Calibration points received.", examples=[100])
+    positives: int = Field(description="How many of them were labelled defective.", examples=[40])
+    drift_reference_size: int = Field(
+        description="Scores now in the drift monitor's reference window. Equals `samples` when "
+        "`set_drift_reference` was true; unchanged otherwise.",
+        examples=[100],
     )

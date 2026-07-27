@@ -24,6 +24,11 @@ pydantic>=2.0
 opencv-python
 numpy
 scikit-learn
+# Declared explicitly rather than leaned on as a scikit-learn transitive: this
+# project imports it directly for `ndimage` (AU-PRO's connected-component
+# labelling) and `stats.ks_2samp` (the drift test), and a dependency you import
+# is a dependency you pin.
+scipy
 matplotlib
 Pillow
 

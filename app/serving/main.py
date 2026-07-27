@@ -1,4 +1,4 @@
-"""The FastAPI application: four endpoints over everything the rest of the app builds.
+"""The FastAPI application: six endpoints over everything the rest of the app builds.
 
 Run it with::
 
@@ -9,13 +9,13 @@ and read the generated contract at ``/docs``.
 What this module is, and is not
 ===============================
 It is the wiring. Every hard part lives somewhere else — quality checks in
-:mod:`app.guardrails`, scoring in :mod:`app.models`, metrics in
-:mod:`app.evaluation`, base64 plumbing in :mod:`app.serving.imaging`, model
-lifetime in :mod:`app.serving.model_registry` — and the handlers below are four
-short functions that call them in the right order and translate failures into
-status codes. That is on purpose: the interesting decisions in a serving layer
-are about *sequencing and failure*, and those are hard to see in a route handler
-that also resizes images.
+:mod:`app.guardrails`, scoring in :mod:`app.models`, metrics, drift and
+calibration in :mod:`app.evaluation`, base64 plumbing in
+:mod:`app.serving.imaging`, model lifetime in :mod:`app.serving.model_registry` —
+and the handlers below are short functions that call them in the right order and
+translate failures into status codes. That is on purpose: the interesting
+decisions in a serving layer are about *sequencing and failure*, and those are
+hard to see in a route handler that also resizes images.
 
 The request path, and why it is ordered this way
 ===============================================
@@ -44,9 +44,8 @@ true for every caller of the model layer, not just this one.
 
 Errors
 ======
-Four exception handlers cover the four ways a request fails, and every one
-returns a small JSON object with a machine-readable ``detail`` slug rather than
-a Python exception:
+Every failure gets an exception handler, and every one returns a small JSON
+object with a machine-readable ``detail`` slug rather than a Python exception:
 
 ===============================  ======  ====================================================
 Condition                        Status  Body
@@ -54,6 +53,8 @@ Condition                        Status  Body
 Undecodable ``image_b64``        422     ``{"detail": "invalid_image", "reason": ...}``
 Frame fails the quality guard    422     ``{"detail": "guard_failed", "reason": "blurry"}``
 Schema/validation failure        422     ``{"detail": "invalid_request", "errors": [...]}``
+Unusable calibration set         422     ``{"detail": "invalid_calibration_set", "reason": ...}``
+Threshold outside ``[0, 1]``     422     ``{"detail": "threshold_out_of_range", ...}``
 No artifact for the backend      503     ``{"detail": "model_not_ready", "backend": ...}``
 Anything else                    500     ``{"detail": "internal_error"}``
 ===============================  ======  ====================================================
@@ -77,26 +78,45 @@ expected. This is also why the registry's cache is locked.
 
 Who may call what
 =================
-Three of the four endpoints are gated by an API key (:mod:`app.serving.auth`),
-and the split follows what a call *costs* rather than what it reveals:
+Every endpoint but ``/health`` is gated by an API key (:mod:`app.serving.auth`),
+and the split follows what a call *costs* and what it *changes* rather than only
+what it reveals:
 
-===============  ==========  =========================================================
-Endpoint         Role        Why
-===============  ==========  =========================================================
-``/health``      *(none)*    A liveness probe cannot hold a credential. Answers
-                             nothing an anonymous caller could not learn by
-                             observing that the port is open.
-``/predict``     ``viewer``  The line's own traffic. One frame, bounded cost.
-``/models``      ``operator``   Enumerates artifacts and filesystem paths.
-``/benchmark``   ``operator``   Minutes of CPU per call, and returns metrics over
-                             the customer's test split.
-===============  ==========  =========================================================
+===============  ============  =======================================================
+Endpoint         Role          Why
+===============  ============  =======================================================
+``/health``      *(none)*      A liveness probe cannot hold a credential. Answers
+                               nothing an anonymous caller could not learn by
+                               observing that the port is open.
+``/predict``     ``viewer``    The line's own traffic. One frame, bounded cost.
+``/models``      ``operator``  Enumerates artifacts and filesystem paths.
+``/drift``       ``operator``  Reports the score distribution over the customer's
+                               production traffic — the same class of disclosure
+                               that gates ``/benchmark``, at a fraction of the cost.
+``/calibrate``   ``operator``  Changes how the service grades parts, for every
+                               caller, until restart. The only *write* in the API.
+``/benchmark``   ``operator``  Minutes of CPU per call, and returns metrics over
+                               the customer's test split.
+===============  ============  =======================================================
 
-``/benchmark`` additionally writes to the audit trail
+``/benchmark`` and ``/calibrate`` additionally write to the audit trail
 (:mod:`app.observability.audit_log`) — a separate append-only file recording who
 ran what and what they got, which survives the log-level filtering an application
-log is subject to. ``docs/security.md`` has the reasoning, and is honest about
-what this buys and what it does not.
+log is subject to. They are audited for opposite reasons: the benchmark because
+of what the caller *learns*, the calibration because of what it *changes*.
+``docs/security.md`` has the reasoning, and is honest about what this buys and
+what it does not.
+
+Reliability, and why ``/drift`` and ``/calibrate`` are a pair
+============================================================
+Everything above assumes the model's scores still mean what they meant when its
+threshold was chosen. :mod:`app.evaluation.drift` is what checks that assumption:
+``/predict`` feeds every score into a rolling window per ``(model, category)``,
+and ``/drift`` compares that window against a reference distribution with a
+two-sample KS test. When it fires, the cheapest fix is usually not a retrain but
+a new operating point — which is ``/calibrate``, and which also re-installs the
+reference the next drift check runs against. One endpoint notices the problem,
+the other resolves the common case, and they share the calibration set.
 
 What a request emits
 ====================
@@ -129,10 +149,10 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 
 from app.data import DataModule
-from app.evaluation import BenchmarkRunner
+from app.evaluation import BenchmarkRunner, evaluate_threshold, find_optimal_threshold
 from app.guardrails import GuardError, guard
 from app.models.base import AnomalyModel
-from app.observability.audit_log import OUTCOME_OK, record_benchmark
+from app.observability.audit_log import OUTCOME_OK, record_benchmark, record_calibration
 from app.observability.logging_config import bind_log_context, configure_logging, get_logger
 from app.observability.metrics import (
     CONTENT_TYPE_LATEST,
@@ -156,17 +176,25 @@ from app.observability.tracing import (
 )
 from app.serving.auth import Principal, require_operator, require_viewer
 from app.serving.imaging import InvalidImageError, decode_image_b64, encode_heatmap_png_b64
-from app.serving.model_registry import ModelNotReadyError, ModelRegistry, get_registry
+from app.serving.model_registry import (
+    ModelNotReadyError,
+    ModelRegistry,
+    ThresholdOutOfRangeError,
+    get_registry,
+)
 from app.serving.schemas import (
     BenchmarkRequest,
     BenchmarkResponse,
+    CalibrationRequest,
+    CalibrationResponse,
+    DriftStatus,
     HealthResponse,
     InferenceRequest,
     InferenceResponse,
     ModelInfo,
 )
 
-__all__ = ["DatasetNotAvailableError", "app"]
+__all__ = ["DatasetNotAvailableError", "InvalidCalibrationSetError", "app"]
 
 log = get_logger(__name__)
 
@@ -205,6 +233,28 @@ class DatasetNotAvailableError(RuntimeError):
         self.category = category
         self.detail = detail
         super().__init__(detail)
+
+
+class InvalidCalibrationSetError(ValueError):
+    """Raised when ``POST /calibrate`` is handed data no threshold can be fitted to.
+
+    The schema already rejects a malformed *request* — wrong types, a label
+    outside ``{0, 1}``, fewer than two samples. What it cannot check is whether
+    the numbers form a usable calibration set: whether both classes are present,
+    whether every score is finite. Those are semantic, they are only knowable by
+    looking at the whole list, and :func:`app.evaluation.calibration.find_optimal_threshold`
+    raises :class:`ValueError` for each with a message written to be read by an
+    operator. This wrapper carries that message to a 422 instead of letting it
+    become a 500.
+
+    422 rather than 400 to match every other rejected body in this API, and
+    ``reason`` carries the explanation because the caller can act on it — unlike
+    the internal errors, whose detail is deliberately withheld.
+    """
+
+    def __init__(self, reason: str) -> None:
+        self.reason = reason
+        super().__init__(reason)
 
 
 @asynccontextmanager
@@ -340,6 +390,45 @@ def _handle_dataset_not_available(request: Request, exc: DatasetNotAvailableErro
     return JSONResponse(
         status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
         content={"detail": "dataset_not_available", "category": exc.category, "reason": exc.detail},
+    )
+
+
+@app.exception_handler(InvalidCalibrationSetError)
+def _handle_invalid_calibration_set(request: Request, exc: InvalidCalibrationSetError) -> JSONResponse:
+    """422: the calibration set is well-formed JSON but cannot produce a threshold."""
+    log.warning("request_rejected", detail="invalid_calibration_set", path=request.url.path, reason=exc.reason)
+    return JSONResponse(
+        status_code=_HTTP_422,
+        content={"detail": "invalid_calibration_set", "reason": exc.reason},
+    )
+
+
+@app.exception_handler(ThresholdOutOfRangeError)
+def _handle_threshold_out_of_range(request: Request, exc: ThresholdOutOfRangeError) -> JSONResponse:
+    """422: the fitted threshold does not fit on the model's score scale.
+
+    Logged at WARNING rather than ERROR: nothing is broken. An uncalibrated
+    backend emitting raw distances is a documented state, and asking it for an
+    operating point on the ``[0, 1]`` scale is a request that cannot be granted
+    rather than a server that has failed.
+    """
+    log.warning(
+        "request_rejected",
+        detail="threshold_out_of_range",
+        path=request.url.path,
+        backend=exc.backend,
+        category=exc.category,
+        threshold=exc.threshold,
+        reason=exc.detail,
+    )
+    return JSONResponse(
+        status_code=_HTTP_422,
+        content={
+            "detail": "threshold_out_of_range",
+            "backend": exc.backend,
+            "threshold": exc.threshold,
+            "reason": exc.detail,
+        },
     )
 
 
@@ -615,6 +704,18 @@ def predict(
         result=RESULT_DEFECTIVE if output.is_defective else RESULT_NORMAL,
     )
 
+    # Into the rolling window this model's drift is judged from. Keyed by the
+    # resolved model name for the same reason the counter above is: an ONNX graph
+    # scores a little differently from the checkpoint it was exported from, and a
+    # window that pooled the two would report that difference as drift.
+    #
+    # Deliberately *after* the verdict and outside the timed section: it is an
+    # O(1) deque append behind an uncontended lock, but it is observability, and
+    # nothing observational belongs inside the number a latency SLO is read from.
+    # It is also unconditional — a monitor that only ran when someone had
+    # configured a reference would have no history the first time anyone asked.
+    registry.monitor_for(output.model_name, request.category).record_score(float(output.anomaly_score))
+
     # The caller's hashed identity, not their key — see app.serving.auth.
     # /predict is high-volume, so it gets a log line rather than an audit entry;
     # the audit trail is reserved for the expensive, privacy-relevant call.
@@ -639,6 +740,242 @@ def predict(
         latency_ms=latency_ms,
         guard_passed=True,
         guard_reason=None,
+    )
+
+
+@app.get("/drift", response_model=list[DriftStatus], tags=["evaluation"])
+def drift(
+    principal: Principal = Depends(require_operator),
+    registry: ModelRegistry = Depends(get_registry),
+) -> list[DriftStatus]:
+    """Report every active monitor's score distribution and its drift verdict.
+
+    One row per ``(model, category)`` that has scored at least one frame since
+    startup, sorted so two consecutive polls are diffable. Each row carries the
+    KS verdict *and* the window's percentiles, and the two are meant to be read
+    together: the p-value says whether the distribution moved, the percentiles
+    say by how much, and only the second answers whether anybody should care.
+    :mod:`app.evaluation.drift` argues this at length, along with what a
+    production system does when a row comes back ``drifted``.
+
+    ``drifted: false, p_value: null`` is the common state of a fresh process and
+    is **not** a clean bill of health — it means no verdict was available,
+    because nothing has established what normal looks like. ``POST /calibrate``
+    does that.
+
+    As cheap as ``/health``: a KS test over at most a few hundred floats plus
+    five percentiles, per monitor. Nothing is loaded, no frame is scored, and it
+    is safe to poll on a dashboard refresh.
+
+    **Operator only.** Not for cost — this is one of the cheapest endpoints in
+    the service — but for disclosure. The summary describes the distribution of
+    anomaly scores over the customer's *production* traffic: how often parts come
+    close to the threshold, how heavy the defect tail is, and, tracked over time,
+    when a line's quality changed. That is the same class of information that
+    gates ``/benchmark``, arrived at from live frames rather than a test split.
+    """
+    statuses: list[DriftStatus] = []
+    for (model_name, category), monitor in sorted(registry.monitors().items()):
+        drifted, reason = monitor.is_drifted()
+        # Two KS computations per monitor (this and the one inside is_drifted),
+        # each microseconds over a bounded window. Caching the p-value on the
+        # monitor would make it stateful to save nothing measurable.
+        p_value = monitor.ks_p_value()
+        summary = monitor.get_summary()
+
+        if drifted:
+            # WARNING and not INFO: this is the line that should reach an alert
+            # rule. It carries the summary spread as top-level fields for the
+            # same reason the guard's metrics are — `p50` as a number is
+            # something a log backend can graph and threshold, whereas the same
+            # value inside a nested object is a string somebody has to parse.
+            log.warning(
+                "drift_detected",
+                model_name=model_name,
+                category=category,
+                reason=reason,
+                p_value=round(p_value, 6) if p_value is not None else None,
+                ks_threshold=monitor.threshold,
+                reference_size=monitor.reference_size,
+                **{key: value for key, value in summary.items() if value is not None},
+            )
+
+        statuses.append(
+            DriftStatus(
+                model_name=model_name,
+                category=category,
+                drifted=drifted,
+                reason=reason,
+                p_value=p_value,
+                threshold=monitor.threshold,
+                window_size=monitor.window_size,
+                reference_size=monitor.reference_size,
+                min_samples=monitor.min_samples,
+                summary=summary,
+            ),
+        )
+
+    log.info(
+        "drift_reported",
+        monitors=len(statuses),
+        drifted=sum(status.drifted for status in statuses),
+        caller=principal.key_id,
+        role=principal.role,
+    )
+    return statuses
+
+
+@app.post("/calibrate", response_model=CalibrationResponse, tags=["evaluation"])
+def calibrate(
+    request: CalibrationRequest,
+    principal: Principal = Depends(require_operator),
+    registry: ModelRegistry = Depends(get_registry),
+) -> CalibrationResponse:
+    """Fit a decision threshold to a labelled score set and apply it in memory.
+
+    The *operating point*: the score at or above which this service calls a part
+    defective. It ships as ``ANOMALY_THRESHOLD=0.5``, which is a guess;
+    :func:`~app.evaluation.calibration.find_optimal_threshold` replaces it with a
+    number fitted to real labelled scores, and this endpoint installs it without
+    a redeploy. See :mod:`app.evaluation.calibration` for which metric to
+    maximise and why F1 is the default.
+
+    **The calibration set must be held out.** Scores from images the model was
+    fitted on produce a threshold that looks excellent here and generalises
+    poorly, and nothing in this endpoint can detect that — ``metric_value`` is
+    computed on the submitted data, so it is an upper bound on production
+    performance rather than an estimate of it.
+
+    By default this also installs the submitted scores as the drift monitor's
+    reference distribution, because the calibration set *is* the new definition
+    of normal: the threshold and the baseline the next drift check runs against
+    should move together, and letting them diverge is how a service ends up
+    alerting against a distribution nobody chose. Pass
+    ``set_drift_reference: false`` to fit the threshold alone.
+
+    **In memory only.** The change is lost on restart, and applies to this
+    process — under ``uvicorn --workers N`` it applies to the *one* worker that
+    served the request, which is a real limitation and the reason a threshold
+    worth keeping belongs in ``ANOMALY_THRESHOLD``. It does survive a model
+    eviction and reload within the process; see
+    :meth:`~app.serving.model_registry.ModelRegistry.set_threshold`.
+
+    **Operator role, and audited.** This is the only endpoint that changes how
+    the service grades parts, for every subsequent caller, and a change that
+    silently moves a scrap rate needs to be attributable long after the
+    application log has rotated. Every call — successful or not — appends an
+    entry to ``results/audit.jsonl``.
+
+    Args:
+        request: The labelled scores, the model they came from, and the metric to
+            maximise.
+
+    Returns:
+        The new threshold, the one it replaced, and what it achieves on the
+        submitted set.
+
+    Raises:
+        InvalidCalibrationSetError: 422 — the samples cannot produce a
+            threshold (one class only, a non-finite score).
+        ThresholdOutOfRangeError: 422 — the fitted value is outside ``[0, 1]``,
+            which means the model is uncalibrated and emits raw distances.
+        ModelNotReadyError: 503 — no artifact can serve this backend/category.
+    """
+    started = time.perf_counter()
+    bind_log_context(model_backend=request.model_backend, category=request.category)
+
+    try:
+        response = _run_calibration(request, registry)
+    except Exception as exc:
+        # Audited before the exception handler turns this into a 422 or a 503. A
+        # rejected calibration is an operator trying to move the threshold and
+        # being refused, which is exactly as worth knowing as a successful one —
+        # repeated failures here are somebody working from a bad calibration set.
+        record_calibration(
+            caller=principal.key_id,
+            role=principal.role,
+            category=request.category,
+            model_name=request.model_backend,
+            duration_seconds=time.perf_counter() - started,
+            metrics={"samples": len(request.samples), "metric": request.metric},
+            outcome=f"failed:{type(exc).__name__}",
+        )
+        raise
+
+    record_calibration(
+        caller=principal.key_id,
+        role=principal.role,
+        category=request.category,
+        model_name=response.model_name,
+        duration_seconds=time.perf_counter() - started,
+        metrics={
+            "metric": response.metric,
+            "threshold": response.threshold,
+            "previous_threshold": response.previous_threshold,
+            "metric_value": response.metric_value,
+            "samples": response.samples,
+            "positives": response.positives,
+        },
+        outcome=OUTCOME_OK,
+    )
+    return response
+
+
+def _run_calibration(request: CalibrationRequest, registry: ModelRegistry) -> CalibrationResponse:
+    """Fit the threshold, install it, and refresh the drift reference.
+
+    Split out of the handler so the audit bookkeeping around it stays legible,
+    matching :func:`_run_benchmark`.
+
+    The order matters and mirrors ``/predict``'s: the *cheap* rejection comes
+    first. Fitting the threshold is milliseconds and needs no model, so an
+    unusable calibration set is refused before the registry is touched — a caller
+    who sends 200 all-normal samples gets ``invalid_calibration_set``, not a
+    thirty-second wait for a cold model load that was never going to be used.
+    """
+    scores = [sample.score for sample in request.samples]
+    labels = [sample.label for sample in request.samples]
+
+    try:
+        threshold = find_optimal_threshold(scores, labels, metric=request.metric)
+        metric_value = evaluate_threshold(scores, labels, threshold, metric=request.metric)
+    except ValueError as exc:
+        # The messages from app.evaluation.calibration are written for an
+        # operator to read, so they are carried through to the 422 body rather
+        # than replaced with a slug. Nothing about the caller's own data is
+        # secret from the caller.
+        raise InvalidCalibrationSetError(str(exc)) from exc
+
+    # Resolves the ONNX fallback, and 503s here if nothing can serve the pair.
+    model = registry.get_model(request.model_backend, request.category)
+    previous = registry.set_threshold(request.model_backend, request.category, threshold)
+
+    monitor = registry.monitor_for(model.model_name, request.category)
+    if request.set_drift_reference:
+        monitor.set_reference(scores)
+
+    log.info(
+        "calibration_applied",
+        model_name=model.model_name,
+        metric=request.metric,
+        threshold=round(threshold, 6),
+        previous_threshold=round(previous, 6),
+        metric_value=round(metric_value, 6),
+        samples=len(scores),
+        positives=int(sum(labels)),
+        drift_reference_size=monitor.reference_size,
+    )
+
+    return CalibrationResponse(
+        model_name=model.model_name,
+        category=request.category,
+        metric=request.metric,
+        threshold=threshold,
+        previous_threshold=previous,
+        metric_value=metric_value,
+        samples=len(scores),
+        positives=int(sum(labels)),
+        drift_reference_size=monitor.reference_size,
     )
 
 

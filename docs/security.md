@@ -21,11 +21,13 @@ VIEWER_API_KEYS=line-station-a,line-station-b
 OPERATOR_API_KEYS=ops-console
 ```
 
-| Endpoint     | Role required | Cost of one call            | What it reveals                       |
+| Endpoint     | Role required | Cost of one call            | What it reveals / changes             |
 | ------------ | ------------- | --------------------------- | ------------------------------------- |
 | `/health`    | *none*        | none                        | liveness, names of resident models    |
 | `/predict`   | `viewer`      | one frame (~150 ms)         | one score and one heatmap             |
 | `/models`    | `operator`    | a few `stat` calls          | artifact paths, which categories exist |
+| `/drift`     | `operator`    | a KS test over ≤500 floats  | the score distribution of **live production traffic** |
+| `/calibrate` | `operator`    | a threshold sweep (~ms)     | **changes how every later request is graded** |
 | `/benchmark` | `operator`    | **minutes of CPU**          | metrics over the whole test split     |
 
 Roles nest: `operator` grants `viewer`, so the operator key works everywhere and
@@ -119,6 +121,66 @@ it.
 
 ---
 
+## Why `/drift` and `/calibrate` are gated, for two new reasons
+
+Neither is expensive. Both are `operator`, and the arguments are different from
+the two above — which is the point of writing them down rather than gating by
+reflex.
+
+### `/drift` — production data, not test data
+
+`/benchmark` leaks properties of the customer's *test split*. `/drift` leaks
+properties of their **live production traffic**, which is a strictly worse
+disclosure of the same kind. The response carries, per model and category, the
+mean, standard deviation and the 10th/50th/90th percentiles of the anomaly scores
+the line has actually produced in the last few hundred frames. From those, an
+unauthenticated caller could read:
+
+- **The current defect rate and how it is trending** — the gap between p50 and
+  p90 against the decision threshold is close to a direct read on what fraction
+  of parts are being scrapped, sampled as often as they care to poll.
+- **When the line's quality changed**, and by how much, without ever seeing a
+  frame. Polling this on a schedule is a time series of a manufacturer's yield.
+- **Whether the process is currently in trouble** — a `drifted: true` row is a
+  standing signal that the deployment is producing scores it was not calibrated
+  for, which is commercially sensitive in exactly the way an incident is.
+
+That it costs microseconds to serve makes this *more* attractive to poll, not
+less. Cost is not the axis this one is gated on.
+
+### `/calibrate` — the only write in the API
+
+Everything else in this service is a read. `POST /calibrate` changes the
+threshold at which the process calls a part defective, for **every subsequent
+caller**, until the process restarts. The abuse case needs no cleverness: a
+threshold set to 1.0 passes every defective part on the line, and a threshold set
+to 0.0 scraps every good one. Neither raises, neither shows up in `/health`, and
+both look exactly like a model that has gone wrong rather than a configuration
+that was changed.
+
+Three controls, and one honest gap:
+
+- **Operator role.** Changing how a machine grades parts is administration, not
+  operation.
+- **Bounded by validation.** The value must land in `[0, 1]`, enforced by the
+  same pydantic declaration that documents `ANOMALY_THRESHOLD`; a fit that lands
+  outside it is refused with `422 threshold_out_of_range` rather than clamped.
+- **Audited** — see below.
+- **The gap: there is no approval step and no history endpoint.** Any operator
+  key can change the operating point, immediately, and the only record is
+  `results/audit.jsonl`. A production deployment of this endpoint wants a
+  four-eyes flow or, better, calibration as a reviewed change to
+  `ANOMALY_THRESHOLD` in the deployment config, with the API used to *find* the
+  number rather than to install it.
+
+Note also that the change is per-process: under `uvicorn --workers N` a
+calibration reaches the one worker that served the request, so the fleet silently
+disagrees about the threshold until restart. That is a correctness problem before
+it is a security one, and it is the strongest argument for treating the endpoint
+as an exploratory tool rather than a control plane.
+
+---
+
 ## What is logged, and why
 
 Two separate destinations, because they answer two different questions and want
@@ -135,7 +197,19 @@ in production.
 ### The audit trail — *who ran the expensive thing, and what did they get?*
 
 `results/audit.jsonl`, append-only, one JSON object per line, independent of log
-level. Every `/benchmark` call — successful or failed — appends one entry:
+level. Two operations append to it, distinguished by the `event` field, and they
+are audited for **opposite** reasons:
+
+- **`benchmark`** — because of what the caller *learns*. Minutes of CPU, and a
+  response describing the customer's test data.
+- **`calibration`** — because of what the caller *changes*. It costs
+  milliseconds and leaks nothing, so neither argument above applies. It is
+  recorded because when someone asks in three weeks why the scrap rate stepped on
+  a Tuesday, the answer is one line of this file, and the application log that
+  would otherwise hold it rotated a fortnight ago. A change to how a machine
+  grades parts should outlive the debugging of it.
+
+Every call — successful or failed — appends one entry:
 
 ```json
 {"timestamp": "2026-07-27T18:44:12+00:00", "event": "benchmark",
@@ -143,6 +217,22 @@ level. Every `/benchmark` call — successful or failed — appends one entry:
  "category": "bottle", "models": ["onnx_efficientad"], "duration_seconds": 41.2,
  "outcome": "ok", "metrics": {"onnx_efficientad": {"image_auroc": 0.976, ...}}}
 ```
+
+A calibration entry reuses the same shape — the `event` field is why a second
+audited operation needed neither a second file nor a schema migration — with
+`models` naming the single model that was updated and `metrics` carrying the
+change:
+
+```json
+{"timestamp": "2026-07-27T20:11:03+00:00", "event": "calibration",
+ "caller": "hmac-sha256:5cd0a7e10b4f2ac9", "role": "operator",
+ "category": "bottle", "models": ["patchcore"], "duration_seconds": 0.004,
+ "outcome": "ok", "metrics": {"metric": "f1", "threshold": 0.412,
+ "previous_threshold": 0.5, "metric_value": 0.985, "samples": 63, "positives": 43}}
+```
+
+One line answers what it was, what it is now, who changed it and on what
+evidence.
 
 Each field earns its place:
 

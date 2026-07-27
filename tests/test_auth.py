@@ -36,6 +36,7 @@ import numpy as np
 import pytest
 from fastapi.testclient import TestClient
 
+from app.evaluation.drift import ScoreDistributionMonitor
 from app.models.base import AnomalyModel, ModelOutput
 from app.models.config import ModelConfig
 from app.observability import audit_log
@@ -125,6 +126,7 @@ class StubRegistry:
     def __init__(self, config: ModelConfig) -> None:
         self.config = config
         self._model = StubModel(config=config)
+        self._monitors: dict[tuple[str, str], ScoreDistributionMonitor] = {}
 
     def get_model(self, backend: str, category: str) -> AnomalyModel:
         return self._model
@@ -134,6 +136,18 @@ class StubRegistry:
 
     def describe(self, category: str) -> list[dict[str, object]]:
         return [{"backend": BACKEND, "available": True, "loaded": True, "artifact": None, "detail": None}]
+
+    # ``/predict`` records every score into a drift monitor and ``/drift`` reads
+    # them back, so the stub carries real monitors rather than no-ops: a stub
+    # that silently swallowed scores would let a broken wiring pass this module.
+    # ``tests/test_drift.py`` owns the behaviour; these two keep the routes
+    # callable at the speed the auth tests need.
+
+    def monitor_for(self, model_name: str, category: str) -> ScoreDistributionMonitor:
+        return self._monitors.setdefault((model_name, category), ScoreDistributionMonitor())
+
+    def monitors(self) -> dict[tuple[str, str], ScoreDistributionMonitor]:
+        return dict(self._monitors)
 
 
 # ---------------------------------------------------------------------------

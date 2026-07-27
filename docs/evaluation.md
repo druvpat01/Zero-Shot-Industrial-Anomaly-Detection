@@ -193,3 +193,146 @@ project is built around: PatchCore is the model to fit when you have good data
 *no* data (near-PatchCore detection, zero-shot, at ~7.5× the latency), and
 EfficientAD is the model to *serve* once converged (constant inference cost in
 training-set size — the property the latency work in the next step measures).
+
+---
+
+## Keeping the numbers true in production: drift and the operating point
+
+Everything above is measured **offline**, on a fixed test split, with ground
+truth. A deployed line has neither: no labels, no fixed split, and a data
+distribution that moves. Two modules cover the gap, and they are a pair —
+[`app/evaluation/drift.py`](../app/evaluation/drift.py) notices the problem and
+[`app/evaluation/calibration.py`](../app/evaluation/calibration.py) fixes the
+common case.
+
+### The failure they exist to catch
+
+[`app/guardrails/`](../app/guardrails) catches a bad *frame*. Nothing above
+catches a bad *score* — because there is nothing wrong with it structurally. The
+model returns a well-formed float in a plausible range; it simply no longer means
+what it meant when the threshold was chosen. Three ordinary causes:
+
+- **The product line changes.** A supplier switches material, a mould is retuned,
+  a new SKU joins the line. Every frame is now slightly out-of-distribution
+  relative to the nominal set PatchCore's memory bank was built from.
+- **The camera ages.** Sensor gain drifts, a lens coating hazes, the LED ring
+  dims over thousands of hours — all of it slow enough to stay well clear of the
+  blur and exposure guards.
+- **Something was deployed.** A new checkpoint, a re-export to ONNX, an
+  `IMAGE_SIZE` change. The service is healthy; the operating point is stale.
+
+In all three `/health` stays green, latency is unchanged, and the defect rate
+quietly moves. That is the silent failure, and it is the expensive kind: by the
+time anyone notices, a shift's worth of parts has been graded against a boundary
+that no longer holds.
+
+### Why the Kolmogorov-Smirnov test
+
+The obvious monitor — *alert if the mean score moves* — assumes the thing that
+changes is the centre of a distribution whose shape you already know. Anomaly
+scores break both halves. They are bounded below, heavily right-skewed and
+usually bimodal (a dense nominal cluster plus a thin defect tail), and the shifts
+that matter are often changes in *shape*: the tail thickening while the nominal
+mode sits exactly where it was, which barely moves the mean at all.
+
+The two-sample KS test needs none of those assumptions. It builds the empirical
+CDF of each window — the reference and the current one — and takes the largest
+vertical gap between the two curves. That statistic's distribution under "both
+samples came from the same underlying distribution" depends only on the two
+sample sizes, not on the shape of the data. It is therefore valid on skewed,
+bimodal, bounded anomaly scores, which is exactly why it is the right test here
+and a t-test is not.
+
+**The p-value does not mean "the probability the model drifted".** It answers a
+narrower question: *if nothing had changed, how often would random sampling alone
+produce a gap at least this large?* `p = 0.30` is unremarkable; `p = 0.001` says
+either something rare happened or the assumption that nothing changed is wrong.
+Below `KS_DRIFT_THRESHOLD` (default `0.05`) the service calls it drift.
+
+Three consequences worth stating plainly:
+
+1. **`0.05` buys a 5% false-alarm rate by construction.** One comparison in
+   twenty crosses the line on a perfectly stable process. That is the definition
+   of the threshold, not a defect in it — and the reason the response to a single
+   alert is *look*, not *halt*.
+2. **A large p-value is not proof of stability.** Failing to detect drift is not
+   detecting its absence; a short window may simply have no power. The monitor
+   reports "no verdict" (`p_value: null`) rather than "no drift" until both
+   windows hold at least 30 scores.
+3. **Statistical significance is not operational significance.** With a large
+   enough window, KS will flag a shift far too small to change a single verdict.
+   `p` says *whether* it moved; the percentiles in the same response say *by how
+   much*. Only the second answers "does this matter", which is why `GET /drift`
+   returns both and the docstrings insist they be read together.
+
+### The response ladder
+
+Deliberately not starting at "stop the line" — a monitor whose only action is
+drastic gets muted within a week:
+
+| Step | Action | When |
+| ---- | ------ | ---- |
+| 1 | **Alert with the numbers.** Cross-check `guard_rejections_total` first | Always — a drift arriving with a rising `blurry` rate is a fouling lens, fixed with a cloth |
+| 2 | **Flag the window for human review** | The frames scored since the drift began were graded against a boundary that may no longer hold |
+| 3 | **Recalibrate the operating point** (`POST /calibrate`) | The scores shifted but stayed separable — minutes of work, and the usual answer |
+| 4 | **Retrain / re-fit the reference** | Recalibration cannot recover the F1: the shape changed, not just the location |
+| 5 | **Gate the line to 100% human inspection** | Only when the alternative is shipping scrap |
+
+### Calibration: choosing the operating point
+
+Every metric in the table above is deliberately **threshold-free** — that is what
+makes AUROC a fair comparison across backends emitting incompatible score scales.
+A production line cannot ship a ranking. It has to answer *pass or scrap*, which
+means committing to one number, and AUROC says nothing about where that number
+should sit: a model at 0.99 AUROC still fails completely at a badly chosen
+threshold.
+
+`find_optimal_threshold(scores, labels, metric="f1")` sweeps every threshold the
+scores can produce and returns the one maximising the metric. The sweep is
+**exact, not a grid** — the confusion matrix can only change where a score crosses
+the boundary, so the distinct score values are the complete candidate set, and
+sorting once with cumulative sums makes the whole thing `O(n log n)`. That is what
+lets it run inside a request handler.
+
+Two design choices worth defending:
+
+- **The metric is the caller's.** `f1` by default (false alarms and missed
+  defects cost about the same), `balanced_accuracy` for a heavily imbalanced
+  calibration set, `precision` for an automatic-scrap line, `recall` where a
+  missed defect is catastrophic *and* a human re-inspects the flagged parts.
+  `precision` and `recall` alone are degenerate at the extremes and the module
+  docstring says so rather than hiding it.
+- **Ties break toward the lowest threshold.** Many thresholds usually achieve the
+  same maximum; the lowest is the most sensitive, so at equal F1 it catches more
+  defects and raises more false alarms. That is the right default for industrial
+  QA, where a false alarm costs an operator thirty seconds at a re-inspection
+  station and a missed defect ships.
+
+`POST /calibrate` applies the result to the running service, and by default also
+installs the submitted scores as the drift monitor's reference — because the
+calibration set *is* the new definition of normal, and letting the threshold and
+the baseline diverge is how a service ends up alerting against a distribution
+nobody chose.
+
+### Two limitations, stated rather than discovered
+
+- **The change is in memory only.** It is lost on restart, and under
+  `uvicorn --workers N` it applies to the one worker that served the request.
+  A threshold worth keeping belongs in `ANOMALY_THRESHOLD`; the endpoint is for
+  finding it and trying it, not for storing it.
+- **`metric_value` is fitted on the submitted data**, so it is an upper bound on
+  production performance rather than an estimate of it. A calibration set drawn
+  from images the model was fitted on produces a threshold that looks excellent
+  and generalises poorly, and nothing in the endpoint can detect that. Hold it
+  out.
+
+```bash
+# Fit an operating point and install it, plus the drift baseline
+curl -s -X POST localhost:8000/calibrate -H "X-API-Key: $OPERATOR_KEY" \
+  -H 'Content-Type: application/json' \
+  -d '{"category":"bottle","model_backend":"patchcore","metric":"f1",
+       "samples":[{"score":0.11,"label":0},{"score":0.94,"label":1}]}'
+
+# Then watch the distribution the line is actually producing
+curl -s localhost:8000/drift -H "X-API-Key: $OPERATOR_KEY" | python -m json.tool
+```

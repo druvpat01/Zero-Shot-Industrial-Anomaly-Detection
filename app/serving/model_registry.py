@@ -49,6 +49,28 @@ the export and says so, both in the log and in the returned model's
 ``model_name`` (``onnx_patchcore``, never ``patchcore``). The response therefore
 tells the caller what actually scored their frame; a silent substitution would
 make a latency or accuracy regression impossible to explain.
+
+Per-model state that is not the model
+=====================================
+Two things besides the weights are keyed here, because this is the only object in
+the process that knows which models exist and outlives any one request:
+
+* **A drift monitor per** ``(model_name, category)``
+  (:meth:`ModelRegistry.monitor_for`). Note the key: the *resolved* model name,
+  not the requested backend. It matches how ``images_processed_total`` attributes
+  a score, so an ONNX fallback accumulates its own distribution rather than
+  silently mixing into the PyTorch backend's — which matters precisely because
+  the two produce slightly different scores from the same weights, and a monitor
+  that pooled them would report that difference as drift.
+* **Threshold overrides per** ``(backend, category)``
+  (:meth:`ModelRegistry.set_threshold`). ``POST /calibrate`` fits a new operating
+  point and applies it to the loaded model by swapping its (frozen)
+  :class:`~app.models.config.ModelConfig` for a revalidated copy. The override is
+  recorded here as well as applied, so a model evicted and rebuilt comes back
+  with the calibrated threshold rather than reverting to ``ANOMALY_THRESHOLD``.
+  It lives in memory only: a restart returns to the configured default, which is
+  a real limitation and is why ``docs/evaluation.md`` says to write a fitted
+  threshold into the environment once it is trusted.
 """
 
 from __future__ import annotations
@@ -60,6 +82,7 @@ from typing import Callable
 
 import numpy as np
 
+from app.evaluation.drift import DEFAULT_WINDOW_SIZE, ScoreDistributionMonitor
 from app.models.base import AnomalyModel
 from app.models.config import ModelConfig, get_model_config
 from app.models.efficientad import EfficientADModel
@@ -69,7 +92,7 @@ from app.models.winclip import WinCLIPModel
 from app.observability.logging_config import get_logger
 from app.observability.metrics import set_models_loaded
 
-__all__ = ["ModelNotReadyError", "ModelRegistry", "get_registry"]
+__all__ = ["ModelNotReadyError", "ModelRegistry", "ThresholdOutOfRangeError", "get_registry"]
 
 log = get_logger(__name__)
 
@@ -129,6 +152,37 @@ class ModelNotReadyError(RuntimeError):
         super().__init__(f"{backend!r} is not ready for category {category!r}: {detail}")
 
 
+class ThresholdOutOfRangeError(ValueError):
+    """Raised when a calibrated threshold cannot be represented in the config.
+
+    :attr:`~app.models.config.ModelConfig.anomaly_threshold` is bounded to
+    ``[0, 1]`` because it is documented as a *normalized* score, and calibrated
+    backends emit exactly that. An **uncalibrated** model emits raw distances
+    instead — PatchCore without a validation pass scores in the single digits —
+    so a threshold fitted to its scores lands outside the range and cannot be
+    installed.
+
+    Reported as a 422 rather than a 500: the calibration set was fine and the
+    arithmetic was fine, but the model this was aimed at does not have an
+    operating point on the ``[0, 1]`` scale. The fix is to calibrate the model
+    itself (train it with a validation split so ``is_calibrated`` is true), not
+    to retry the request.
+
+    Attributes:
+        backend: The backend the threshold was aimed at.
+        category: The category it was aimed at.
+        threshold: The value that could not be installed.
+        detail: Human-readable explanation, safe to return to the caller.
+    """
+
+    def __init__(self, backend: str, category: str, threshold: float, detail: str) -> None:
+        self.backend = backend
+        self.category = category
+        self.threshold = float(threshold)
+        self.detail = detail
+        super().__init__(detail)
+
+
 class ModelRegistry:
     """Lazily builds and caches one :class:`AnomalyModel` per ``(backend, category)``.
 
@@ -143,6 +197,10 @@ class ModelRegistry:
         warmup: Whether to score one synthetic frame at load time. On by default
             — see the module docstring. Tests that only care about *which* model
             comes back turn it off to keep the suite quick.
+        drift_window_size: Rolling window each
+            :class:`~app.evaluation.drift.ScoreDistributionMonitor` keeps. Passed
+            through rather than read from the environment here so a test can make
+            a monitor fill in a handful of scores.
 
     Example:
         >>> registry = ModelRegistry()                              # doctest: +SKIP
@@ -157,15 +215,22 @@ class ModelRegistry:
         *,
         exported_dir: Path | str | None = None,
         warmup: bool = True,
+        drift_window_size: int = DEFAULT_WINDOW_SIZE,
     ) -> None:
         self._config = config
         self._exported_dir = Path(exported_dir) if exported_dir is not None else None
         self._warmup = warmup
+        self._drift_window_size = drift_window_size
 
         self._models: dict[tuple[str, str], AnomalyModel] = {}
-        # Guards the two dicts below it, and nothing else. Held for microseconds.
+        # Guards every dict below it, and nothing else. Held for microseconds.
         self._table_lock = threading.Lock()
         self._key_locks: dict[tuple[str, str], threading.Lock] = {}
+        #: (model_name, category) -> monitor. Keyed by the *resolved* model name;
+        #: see the module docstring for why that differs from the model cache's key.
+        self._monitors: dict[tuple[str, str], ScoreDistributionMonitor] = {}
+        #: (backend, category) -> calibrated anomaly_threshold, survives a reload.
+        self._thresholds: dict[tuple[str, str], float] = {}
 
     def __repr__(self) -> str:
         return f"{type(self).__name__}(loaded={self.loaded_keys()})"
@@ -197,9 +262,17 @@ class ModelRegistry:
             return (backend.strip().lower(), category) in self._models
 
     def clear(self) -> None:
-        """Drop every cached model. Frees the weights; used by tests."""
+        """Drop every cached model, drift monitor and threshold override.
+
+        Frees the weights; used by tests. The monitors and overrides go with them
+        rather than surviving, because all three are per-model state and a
+        registry that reported a drift summary for a model it no longer holds
+        would be lying about where the numbers came from.
+        """
         with self._table_lock:
             self._models.clear()
+            self._monitors.clear()
+            self._thresholds.clear()
             remaining = len(self._models)
         # The unload half of ``models_loaded_count``. Published from inside the
         # only two methods that change the dict's size, so the gauge cannot drift
@@ -321,6 +394,11 @@ class ModelRegistry:
 
             started = time.perf_counter()
             model = self._load(name, category)
+            # Before the warm-up and before caching: a threshold fitted by an
+            # earlier POST /calibrate has to be back in place the moment this
+            # model is reachable, or the first request after an eviction is
+            # judged against ANOMALY_THRESHOLD instead of the calibrated point.
+            self._apply_threshold_override(model, key)
             if self._warmup:
                 self._warm(model, name, category)
             elapsed = time.perf_counter() - started
@@ -489,6 +567,128 @@ class ModelRegistry:
             backend=backend,
             category=category,
             duration_seconds=round(time.perf_counter() - started, 3),
+        )
+
+    # -- drift monitoring ------------------------------------------------------
+
+    def monitor_for(self, model_name: str, category: str) -> ScoreDistributionMonitor:
+        """The drift monitor for one ``(model_name, category)``, created on first use.
+
+        Args:
+            model_name: The *resolved* name from
+                :attr:`~app.models.base.ModelOutput.model_name` — what actually
+                scored the frame, so an ONNX fallback gets its own monitor. See
+                the module docstring.
+            category: The category the frame belongs to.
+
+        Returns:
+            The monitor, which is shared: two concurrent ``/predict`` calls for
+            the same pair record into the same window, which is the point.
+        """
+        key = (model_name, category)
+        with self._table_lock:
+            monitor = self._monitors.get(key)
+            if monitor is None:
+                monitor = ScoreDistributionMonitor(window_size=self._drift_window_size)
+                self._monitors[key] = monitor
+        return monitor
+
+    def monitors(self) -> dict[tuple[str, str], ScoreDistributionMonitor]:
+        """Every active monitor, keyed by ``(model_name, category)``.
+
+        A snapshot of the dict, not the dict itself, so ``GET /drift`` can
+        iterate while the prediction path keeps creating monitors. The monitors
+        it hands out are the live ones — each is independently thread-safe.
+        """
+        with self._table_lock:
+            return dict(self._monitors)
+
+    # -- calibration -----------------------------------------------------------
+
+    def set_threshold(self, backend: str, category: str, threshold: float) -> float:
+        """Install a calibrated decision threshold, and return the one it replaced.
+
+        Applied by swapping the model's frozen
+        :class:`~app.models.config.ModelConfig` for a revalidated copy rather
+        than mutating it: the config is frozen precisely so nothing can change
+        under a running model, and every backend reads
+        ``self.config.anomaly_threshold`` at predict time, so the next request
+        sees the new value and no in-flight one sees a half-applied change.
+
+        Loading the model first is deliberate. Recording an override against a
+        backend that cannot be served would report success for a change nobody
+        will ever see; this way a missing artifact fails as
+        :class:`ModelNotReadyError` — the same 503 ``/predict`` gives — before
+        anything is recorded.
+
+        Args:
+            backend: One of :data:`~app.serving.schemas.MODEL_BACKENDS`.
+            category: MVTec-style category.
+            threshold: The new operating point. A frame is defective when
+                ``anomaly_score >= threshold``.
+
+        Returns:
+            The threshold that was in force before this call.
+
+        Raises:
+            ModelNotReadyError: If no artifact can serve this pair.
+            ThresholdOutOfRangeError: If the value is outside the ``[0, 1]``
+                range ``anomaly_threshold`` is bounded to.
+        """
+        name = backend.strip().lower()
+        model = self.get_model(name, category)
+        previous = float(model.config.anomaly_threshold)
+        value = float(threshold)
+
+        try:
+            # pydantic revalidates the whole config here, so the [0, 1] bound on
+            # anomaly_threshold is enforced by the same declaration that
+            # documents it rather than by a second copy of the rule.
+            updated = model.config.with_overrides(anomaly_threshold=value)
+        except ValueError as exc:  # pydantic's ValidationError is a ValueError
+            detail = (
+                f"threshold {value:.6g} is outside the [0, 1] range anomaly_threshold accepts. "
+                f"{model.model_name} reports is_calibrated={model.is_calibrated}; an uncalibrated "
+                "backend emits raw distances, so a threshold fitted to its scores has no place on "
+                "the normalized scale. Train it with a validation split, or compare raw scores "
+                "outside the service."
+            )
+            raise ThresholdOutOfRangeError(name, category, value, detail) from exc
+
+        model.config = updated
+        with self._table_lock:
+            self._thresholds[(name, category)] = value
+
+        log.info(
+            "threshold_updated",
+            backend=name,
+            category=category,
+            model_name=model.model_name,
+            previous_threshold=round(previous, 6),
+            threshold=round(value, 6),
+            calibrated=model.is_calibrated,
+            persistence="in-memory only; lost on restart",
+        )
+        return previous
+
+    def threshold_overrides(self) -> dict[tuple[str, str], float]:
+        """Every calibrated threshold currently in force, keyed by ``(backend, category)``."""
+        with self._table_lock:
+            return dict(self._thresholds)
+
+    def _apply_threshold_override(self, model: AnomalyModel, key: tuple[str, str]) -> None:
+        """Re-apply a recorded threshold to a model that was just built."""
+        with self._table_lock:
+            override = self._thresholds.get(key)
+        if override is None:
+            return
+        model.config = model.config.with_overrides(anomaly_threshold=override)
+        log.info(
+            "threshold_override_reapplied",
+            backend=key[0],
+            category=key[1],
+            model_name=model.model_name,
+            threshold=round(override, 6),
         )
 
 
