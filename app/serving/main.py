@@ -72,6 +72,29 @@ an ``async def`` handler runs *on the event loop*, so one in-flight prediction
 would stall every other connection including the health check. Declaring them
 sync hands them to Starlette's thread pool, where blocking is exactly what is
 expected. This is also why the registry's cache is locked.
+
+Who may call what
+=================
+Three of the four endpoints are gated by an API key (:mod:`app.serving.auth`),
+and the split follows what a call *costs* rather than what it reveals:
+
+===============  ==========  =========================================================
+Endpoint         Role        Why
+===============  ==========  =========================================================
+``/health``      *(none)*    A liveness probe cannot hold a credential. Answers
+                             nothing an anonymous caller could not learn by
+                             observing that the port is open.
+``/predict``     ``viewer``  The line's own traffic. One frame, bounded cost.
+``/models``      ``operator``   Enumerates artifacts and filesystem paths.
+``/benchmark``   ``operator``   Minutes of CPU per call, and returns metrics over
+                             the customer's test split.
+===============  ==========  =========================================================
+
+``/benchmark`` additionally writes to the audit trail
+(:mod:`app.observability.audit_log`) — a separate append-only file recording who
+ran what and what they got, which survives the log-level filtering an application
+log is subject to. ``docs/security.md`` has the reasoning, and is honest about
+what this buys and what it does not.
 """
 
 from __future__ import annotations
@@ -87,6 +110,8 @@ from app.data import DataModule
 from app.evaluation import BenchmarkRunner
 from app.guardrails import GuardError, guard
 from app.models.base import AnomalyModel
+from app.observability.audit_log import OUTCOME_OK, record_benchmark
+from app.serving.auth import Principal, require_operator, require_viewer
 from app.serving.imaging import InvalidImageError, decode_image_b64, encode_heatmap_png_b64
 from app.serving.model_registry import ModelNotReadyError, ModelRegistry, get_registry
 from app.serving.schemas import (
@@ -138,7 +163,10 @@ app = FastAPI(
         "Scores inspection frames for defects and returns a pixel-level heatmap, "
         "using PatchCore, EfficientAD or zero-shot WinCLIP — the PyTorch wrappers "
         "or their exported ONNX graphs. Models load lazily on first use, so "
-        "`/health` answers immediately at startup."
+        "`/health` answers immediately at startup.\n\n"
+        "Authenticate with an `X-API-Key` header. `/predict` needs a **viewer** key; "
+        "`/models` and `/benchmark` need an **operator** key; `/health` is open so "
+        "liveness probes work."
     ),
 )
 
@@ -238,13 +266,20 @@ def _handle_unexpected(request: Request, exc: Exception) -> JSONResponse:
 
 @app.get("/health", response_model=HealthResponse, tags=["ops"])
 def health(registry: ModelRegistry = Depends(get_registry)) -> HealthResponse:
-    """Liveness probe. Loads nothing and touches no disk.
+    """Liveness probe. Loads nothing, touches no disk, needs no credential.
 
     This is the contract that makes lazy loading work: a container orchestrator
     can get a ready signal in milliseconds after startup, instead of waiting out
     a model load and killing the pod for failing its probe. ``models_loaded``
     reports what happens to be resident *now*, which is empty until the first
     ``/predict``.
+
+    Unauthenticated on purpose, and it is the *only* such endpoint. A kubelet
+    probe cannot hold an API key, and a health check that can fail closed on a
+    credential problem is a health check that will eventually restart a perfectly
+    healthy pod. What it discloses is bounded to match: liveness and the names of
+    resident models, which is strictly less than an anonymous caller learns from
+    the port being open at all.
     """
     return HealthResponse(status="ok", models_loaded=registry.loaded_keys())
 
@@ -256,6 +291,7 @@ def list_models(
         description="Category to report availability for. Defaults to the configured DEFAULT_CATEGORY.",
         examples=["bottle"],
     ),
+    principal: Principal = Depends(require_operator),
     registry: ModelRegistry = Depends(get_registry),
 ) -> list[ModelInfo]:
     """List every backend and whether it can serve ``category`` right now.
@@ -265,14 +301,21 @@ def list_models(
     can be polled. ``detail`` explains the interesting cases: which file is
     missing, or that a backend would be served by an ONNX fallback rather than
     the checkpoint the caller might assume.
+
+    **Operator only**, despite being cheap. Cost is not the reason this one is
+    gated: ``detail`` and ``artifact`` name absolute filesystem paths and the
+    exact set of trained categories, which is a free map of the deployment for
+    anyone probing it. That is an operator's business, not a viewer's.
     """
     resolved = category or registry.config.category
+    logger.debug("Listing models for %r (requested by %s)", resolved, principal)
     return [ModelInfo(**row) for row in registry.describe(resolved)]
 
 
 @app.post("/predict", response_model=InferenceResponse, tags=["inference"])
 def predict(
     request: InferenceRequest,
+    principal: Principal = Depends(require_viewer),
     registry: ModelRegistry = Depends(get_registry),
 ) -> InferenceResponse:
     """Score one frame and return its anomaly score plus a pixel-level heatmap.
@@ -280,6 +323,14 @@ def predict(
     See the module docstring for why the steps happen in this order. In short:
     the cheap rejections (undecodable payload, unusable frame) come first and
     need no model, so a bad request never triggers a model load.
+
+    **Viewer role.** This is the endpoint the inspection line itself calls, and a
+    line operator's key must open it. One known consequence: the first request
+    for a cold backend pays that backend's load, so a viewer can indirectly cause
+    a multi-second, multi-hundred-megabyte model load even though loading is
+    nominally an operator concern. Gating it would mean a viewer key that only
+    works once somebody else has warmed the process, which is worse. The mismatch
+    is real and ``docs/security.md`` names it rather than papering over it.
 
     Args:
         request: The frame and the backend that should score it.
@@ -325,10 +376,14 @@ def predict(
     heatmap_b64 = encode_heatmap_png_b64(output.anomaly_map, calibrated=model.is_calibrated)
 
     latency_ms = (time.perf_counter() - started - load_elapsed) * 1000.0
+    # The caller's hashed identity, not their key — see app.serving.auth.
+    # /predict is high-volume, so it gets a log line rather than an audit entry;
+    # the audit trail is reserved for the expensive, privacy-relevant call.
     logger.info(
-        "Scored %s/%s: score=%.4f defective=%s in %.1fms",
+        "Scored %s/%s for %s: score=%.4f defective=%s in %.1fms",
         request.model_backend,
         request.category,
+        principal,
         output.anomaly_score,
         output.is_defective,
         latency_ms,
@@ -350,6 +405,7 @@ def predict(
 @app.post("/benchmark", response_model=BenchmarkResponse, tags=["evaluation"])
 def benchmark(
     request: BenchmarkRequest,
+    principal: Principal = Depends(require_operator),
     registry: ModelRegistry = Depends(get_registry),
 ) -> BenchmarkResponse:
     """Score every requested backend over a category's full test split.
@@ -362,6 +418,15 @@ def benchmark(
     duration and there is no timeout that will save a caller who expected
     otherwise. Use it from a script, a CI job or a dashboard refresh; never from
     a request path a user is waiting on, and never as a health check.
+
+    **Operator role, and audited.** Everything in the paragraph above is also a
+    description of a denial-of-service primitive, which is the first reason this
+    is the most restricted endpoint in the service; the second is that its
+    response describes the customer's test data (how many images, how many
+    defective, how separable) to whoever asks. So every call — successful or not
+    — appends an entry to ``results/audit.jsonl`` naming the hashed caller, what
+    they asked for, what it cost and what they received. See
+    :mod:`app.observability.audit_log` and ``docs/security.md``.
 
     A JSON report is also written to
     ``results/benchmark_<category>_<timestamp>.json`` as a side effect, matching
@@ -377,6 +442,44 @@ def benchmark(
     Raises:
         ModelNotReadyError: 503 — one of the backends has no artifact.
         DatasetNotAvailableError: 503 — the category's test split is not on disk.
+    """
+    started = time.perf_counter()
+    try:
+        results = _run_benchmark(request, registry)
+    except Exception as exc:
+        # Audited before the exception handler turns this into a 503 or a 500.
+        # A failed benchmark still consumed the CPU up to the point it failed,
+        # and "this key repeatedly triggers minute-long failures" is precisely
+        # the pattern an audit trail exists to make visible.
+        record_benchmark(
+            caller=principal.key_id,
+            role=principal.role,
+            category=request.category,
+            models=request.model_backends,
+            duration_seconds=time.perf_counter() - started,
+            metrics={},
+            outcome=f"failed:{type(exc).__name__}",
+        )
+        raise
+
+    record_benchmark(
+        caller=principal.key_id,
+        role=principal.role,
+        category=request.category,
+        models=request.model_backends,
+        duration_seconds=time.perf_counter() - started,
+        metrics=results,
+        outcome=OUTCOME_OK,
+    )
+    return BenchmarkResponse(results=results)
+
+
+def _run_benchmark(request: BenchmarkRequest, registry: ModelRegistry) -> dict[str, dict]:
+    """The benchmark itself: resolve the backends, load the split, score it.
+
+    Split out of the handler so the audit bookkeeping around it stays legible —
+    the handler is then "time it, run it, record it, whichever way it goes" and
+    this is the part that does the work.
     """
     config = registry.config.with_overrides(category=request.category)
 
@@ -421,4 +524,4 @@ def benchmark(
     results = BenchmarkRunner(list(models.values()), datamodule, results_dir=config.results_dir).run()
     logger.info("Benchmark of %r finished in %.1fs", request.category, time.perf_counter() - started)
 
-    return BenchmarkResponse(results=results)
+    return results

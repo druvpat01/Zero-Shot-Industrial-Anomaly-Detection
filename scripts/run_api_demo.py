@@ -35,6 +35,14 @@ ONNX graph exported from a different category. All of those leave a model that
 still returns plausible numbers in the right range, and all of them collapse the
 separation this checks.
 
+Authentication
+==============
+``/models`` and ``/predict`` are gated (see ``docs/security.md``), so the demo
+needs a key. By default it reads the *same* ``.env`` the child server will read
+and uses the first operator key it finds, which means a working ``.env`` is the
+only setup step; ``--api-key`` overrides it, and is the way to watch the demo
+fail with a 401 or a 403 on purpose.
+
 Exits non-zero if the assertion fails, so it can be a CI step.
 """
 
@@ -57,6 +65,7 @@ from urllib.request import Request, urlopen
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from app.data.datamodule import DEFAULT_DATA_ROOT  # noqa: E402
+from app.serving.auth import API_KEY_HEADER, AuthConfig  # noqa: E402
 from app.serving.schemas import MODEL_BACKENDS  # noqa: E402
 
 logger = logging.getLogger("run_api_demo")
@@ -101,6 +110,14 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--base-url",
         default=None,
         help="Talk to an already-running server at this URL instead of starting one.",
+    )
+    parser.add_argument(
+        "--api-key",
+        default=None,
+        help=(
+            "X-API-Key to send. Defaults to the first OPERATOR_API_KEYS entry in the "
+            "environment or .env; pass a viewer key to watch /models 403 instead."
+        ),
     )
     parser.add_argument(
         "--log-level",
@@ -219,22 +236,42 @@ def wait_for_health(base_url: str, process: subprocess.Popen | None, timeout: fl
 # ---------------------------------------------------------------------------
 
 
-def _get(url: str, *, timeout: float) -> dict:
-    with urlopen(Request(url, method="GET"), timeout=timeout) as response:  # noqa: S310 - fixed localhost URL
+def _default_api_key() -> str | None:
+    """The first operator key the environment (or ``.env``) offers, else a viewer key.
+
+    Reading the server's own configuration rather than taking a flag means the
+    demo works straight after ``cp .env.example .env`` — the child server and
+    this script agree by construction, instead of by the operator remembering to
+    paste the same string twice.
+    """
+    config = AuthConfig.from_env()
+    for keys in (config.operator_keys, config.viewer_keys):
+        if keys:
+            return keys[0]
+    return None
+
+
+def _auth_headers(api_key: str | None) -> dict[str, str]:
+    return {API_KEY_HEADER: api_key} if api_key else {}
+
+
+def _get(url: str, *, timeout: float, api_key: str | None = None) -> dict:
+    request = Request(url, headers=_auth_headers(api_key), method="GET")  # noqa: S310 - fixed localhost URL
+    with urlopen(request, timeout=timeout) as response:  # noqa: S310
         return json.loads(response.read())
 
 
-def _post(url: str, payload: dict, *, timeout: float) -> tuple[int, dict]:
+def _post(url: str, payload: dict, *, timeout: float, api_key: str | None = None) -> tuple[int, dict]:
     """POST JSON and return ``(status, body)``, treating an error status as data.
 
-    The API's failure modes are structured JSON, so a 422 or 503 is something to
-    print rather than an exception to raise — ``urlopen`` disagrees, hence the
+    The API's failure modes are structured JSON, so a 401, 422 or 503 is something
+    to print rather than an exception to raise — ``urlopen`` disagrees, hence the
     ``HTTPError`` catch.
     """
     request = Request(  # noqa: S310 - fixed localhost URL
         url,
         data=json.dumps(payload).encode(),
-        headers={"Content-Type": "application/json"},
+        headers={"Content-Type": "application/json", **_auth_headers(api_key)},
         method="POST",
     )
     try:
@@ -249,7 +286,13 @@ def _post(url: str, payload: dict, *, timeout: float) -> tuple[int, dict]:
 # ---------------------------------------------------------------------------
 
 
-def run_demo(base_url: str, category: str, backend: str, samples: list[tuple[Path, bool]]) -> int:
+def run_demo(
+    base_url: str,
+    category: str,
+    backend: str,
+    samples: list[tuple[Path, bool]],
+    api_key: str | None = None,
+) -> int:
     """Score every sample, print the table, and check the separation. Returns an exit code."""
     print(f"\nServer     : {base_url}")
     print(f"Category   : {category}")
@@ -257,7 +300,18 @@ def run_demo(base_url: str, category: str, backend: str, samples: list[tuple[Pat
     print(f"Images     : {len(samples)} ({sum(is_bad for _, is_bad in samples)} defective, "
           f"{sum(not is_bad for _, is_bad in samples)} clean)")
 
-    available = {row["backend"]: row for row in _get(f"{base_url}/models?category={category}", timeout=30.0)}
+    try:
+        rows = _get(f"{base_url}/models?category={category}", timeout=30.0, api_key=api_key)
+    except HTTPError as exc:
+        # 401/403 here means the key is missing or is a viewer's. Worth naming,
+        # because the alternative is a stack trace that says only "HTTP Error".
+        print(
+            f"\nGET /models -> HTTP {exc.code}: {json.loads(exc.read() or b'{}')}. "
+            f"/models needs an operator key — set OPERATOR_API_KEYS in .env or pass --api-key.",
+        )
+        return 1
+
+    available = {row["backend"]: row for row in rows}
     row = available.get(backend, {})
     if not row.get("available", False):
         print(f"\n{backend!r} is not available for {category!r}: {row.get('detail')}")
@@ -275,7 +329,12 @@ def run_demo(base_url: str, category: str, backend: str, samples: list[tuple[Pat
             "model_backend": backend,
             "image_b64": base64.b64encode(path.read_bytes()).decode("ascii"),
         }
-        status_code, body = _post(f"{base_url}/predict", payload, timeout=_REQUEST_TIMEOUT_SECONDS)
+        status_code, body = _post(
+            f"{base_url}/predict",
+            payload,
+            timeout=_REQUEST_TIMEOUT_SECONDS,
+            api_key=api_key,
+        )
 
         label = f"{path.parent.name}/{path.name}"
         if status_code != 200:
@@ -329,6 +388,14 @@ def main(argv: list[str] | None = None) -> int:
 
     samples = collect_samples(args.data_root, args.category)
 
+    api_key = args.api_key or _default_api_key()
+    if api_key is None:
+        msg = (
+            "No API key available. /models and /predict are authenticated: set "
+            "OPERATOR_API_KEYS in .env (see .env.example) or pass --api-key."
+        )
+        raise SystemExit(msg)
+
     process: subprocess.Popen | None = None
     if args.base_url:
         base_url = args.base_url.rstrip("/")
@@ -341,7 +408,7 @@ def main(argv: list[str] | None = None) -> int:
         health = wait_for_health(base_url, process, _STARTUP_TIMEOUT_SECONDS)
         # Empty at this point, and that is the assertion: startup loaded nothing.
         print(f"\n/health -> {health}")
-        exit_code = run_demo(base_url, args.category, args.backend, samples)
+        exit_code = run_demo(base_url, args.category, args.backend, samples, api_key=api_key)
         print(f"/health -> {_get(f'{base_url}/health', timeout=30.0)}")
         return exit_code
     finally:

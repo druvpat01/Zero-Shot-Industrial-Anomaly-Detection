@@ -18,6 +18,12 @@ blur is a fouled lens, a 10x10 array is a truncated read — because the guard i
 what the API is delegating to, and the API test should fail for the same reasons
 the guard test does.
 
+Every request here carries an operator key. ``tests/test_auth.py`` owns the
+access-control behaviour; this file is about the request path *behind* the guard,
+so it authenticates once in a fixture and then ignores the subject entirely. The
+key comes from an injected :class:`~app.serving.auth.AuthConfig` rather than from
+the environment, so the suite neither reads nor depends on a real ``.env``.
+
 Dataset- and checkpoint-backed tests skip rather than fail when their artifacts
 are absent, matching the model suites. Populate them with::
 
@@ -39,12 +45,17 @@ from fastapi.testclient import TestClient
 from app.data.datamodule import DEFAULT_DATA_ROOT
 from app.models.config import get_model_config
 from app.models.onnx_runner import DEFAULT_EXPORTED_DIR, onnx_artifact_path
+from app.serving.auth import API_KEY_HEADER, AuthConfig, get_auth_config
 from app.serving.main import app
 from app.serving.model_registry import ModelNotReadyError, ModelRegistry, get_registry
 from app.serving.schemas import MODEL_BACKENDS
 
 CATEGORY = "bottle"
 BACKEND = "patchcore"
+
+#: An operator key, so every request in this file clears every gate. Not a
+#: secret and not read from anywhere — the config carrying it is injected below.
+OPERATOR_KEY = "test-operator-key"
 
 CATEGORY_DIR: Path = DEFAULT_DATA_ROOT / CATEGORY
 GOOD_TEST_DIR: Path = CATEGORY_DIR / "test" / "good"
@@ -107,9 +118,23 @@ def _blurred_frame() -> np.ndarray:
 
 
 @pytest.fixture(scope="module")
-def client() -> TestClient:
+def authenticated_app():
+    """Install a known key set for this module, and restore the real one after.
+
+    Overriding the *config* rather than the auth dependency itself means these
+    requests still run the whole check — header parsing, key comparison, role
+    grant — instead of bypassing it. A regression that broke authentication for
+    valid operator keys would fail this module too, not just ``test_auth.py``.
+    """
+    app.dependency_overrides[get_auth_config] = lambda: AuthConfig(operator_keys=(OPERATOR_KEY,))
+    yield
+    app.dependency_overrides.pop(get_auth_config, None)
+
+
+@pytest.fixture(scope="module")
+def client(authenticated_app) -> TestClient:
     """A client over the real app, with the process-wide registry in place."""
-    return TestClient(app)
+    return TestClient(app, headers={API_KEY_HEADER: OPERATOR_KEY})
 
 
 @pytest.fixture

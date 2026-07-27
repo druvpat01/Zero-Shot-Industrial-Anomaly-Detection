@@ -21,6 +21,11 @@ data/**/*
 results/**/*.json
 !results/**/.gitkeep
 
+# Audit trail. Never committed: it names callers (hashed) and carries the
+# benchmark metrics whose disclosure is half the reason /benchmark is gated.
+results/audit.jsonl
+results/**/*.jsonl
+
 # anomalib's Engine creates a versioned run workspace, results/<Model>/<Dataset>/
 # <category>/vN, on every fit. Our own artifacts go to results/checkpoints/.
 results/*/

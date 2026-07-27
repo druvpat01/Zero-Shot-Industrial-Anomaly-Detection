@@ -39,3 +39,10 @@ make serve
 ```
 
 Copy `.env.example` to `.env` and adjust configuration as needed.
+
+`.env` is also where API keys live. `/predict`, `/models` and `/benchmark` are
+gated by an `X-API-Key` header, and a server with no keys configured refuses all
+three with `503 auth_not_configured` — set `VIEWER_API_KEYS` and
+`OPERATOR_API_KEYS` before `make serve`. `/health` stays open for liveness
+probes. [`docs/security.md`](docs/security.md) explains what is gated, what is
+audited, and what production would still require.
