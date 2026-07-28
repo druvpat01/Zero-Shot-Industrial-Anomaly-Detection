@@ -140,6 +140,8 @@ work than one.
 
 from __future__ import annotations
 
+import os
+import threading
 import time
 from contextlib import asynccontextmanager
 from typing import AsyncIterator
@@ -257,6 +259,73 @@ class InvalidCalibrationSetError(ValueError):
         super().__init__(reason)
 
 
+#: Environment switch for the startup re-warm. On by default: the loads run in a
+#: background thread and cost nothing a caller can observe, so the case for
+#: opting out is narrow — a memory-constrained box, or a debugging session where
+#: a model loading behind you is a distraction rather than a help.
+_WARM_ON_STARTUP_VAR = "WARM_MODELS_ON_STARTUP"
+
+_FALSE_VALUES = frozenset({"0", "false", "no", "off"})
+
+#: How long shutdown waits for the warm-up thread before giving up on it.
+#: Bounded because a warm-up is speculative — nothing is waiting for its result,
+#: so it has no claim on the shutdown budget — and non-zero because *abandoning*
+#: a thread inside a torch deserialisation is how a clean exit turns into
+#: "terminate called without an active exception" and a core dump in the logs.
+#: Long enough for a checkpoint load to reach a safe point, short enough to stay
+#: well inside Docker's 10-second SIGTERM grace period.
+_WARM_SHUTDOWN_JOIN_SECONDS = 5.0
+
+
+def _warm_on_startup_enabled() -> bool:
+    return os.environ.get(_WARM_ON_STARTUP_VAR, "true").strip().lower() not in _FALSE_VALUES
+
+
+def _start_cache_warm(registry: ModelRegistry, stop: threading.Event) -> threading.Thread | None:
+    """Rebuild the last-known working set on a background thread, or don't.
+
+    A thread rather than an ``await``, and started rather than joined *here*,
+    because the entire value of this is that it is invisible: ``lifespan``
+    returns, the server binds, ``/health`` answers, and the models arrive when
+    they arrive. Joining at startup would reintroduce exactly the slow-start
+    problem that :mod:`app.serving.model_registry`'s laziness exists to solve.
+
+    Daemon, so a wedged load cannot hold a container open past its grace period;
+    but see :func:`_stop_cache_warm`, which still gives it a bounded chance to
+    finish. Daemon *and* never joined is the combination that produces a core
+    dump at interpreter exit, and a crash on the way out is indistinguishable
+    from a crash that mattered when you are reading the logs afterwards.
+    """
+    if not _warm_on_startup_enabled():
+        log.info("model_warm_disabled", variable=_WARM_ON_STARTUP_VAR)
+        return None
+    thread = threading.Thread(
+        target=registry.warm_from_cache,
+        args=(stop,),
+        name="model-warm",
+        daemon=True,
+    )
+    thread.start()
+    return thread
+
+
+def _stop_cache_warm(thread: threading.Thread | None, stop: threading.Event) -> None:
+    """Ask the warm-up to stop, and give it a bounded moment to do so."""
+    stop.set()
+    if thread is None or not thread.is_alive():
+        return
+    thread.join(timeout=_WARM_SHUTDOWN_JOIN_SECONDS)
+    if thread.is_alive():
+        # It is inside a single model load, which has no interruption point.
+        # Say so rather than exiting silently: this is the one line that
+        # explains an ugly interpreter teardown if one follows.
+        log.warning(
+            "model_warm_abandoned",
+            timeout_seconds=_WARM_SHUTDOWN_JOIN_SECONDS,
+            detail="a model load did not finish within the shutdown budget; it is discarded",
+        )
+
+
 @asynccontextmanager
 async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
     """Configure observability once, before the first request, and flush on the way out.
@@ -268,13 +337,23 @@ async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
     keeping the call in one place is what makes "when does logging start being
     structured" a question with an answer.
 
-    Startup only touches configuration: no model is loaded here, and that is the
-    contract the whole lazy-loading design in
+    Startup only touches configuration: no model is loaded *on this path*, and
+    that is the contract the whole lazy-loading design in
     :mod:`app.serving.model_registry` rests on. A container orchestrator gets a
     ready signal in milliseconds instead of waiting out a 30-second CLIP load and
     killing the pod for failing its probe.
 
-    Shutdown flushes the tracer. A :class:`~opentelemetry.sdk.trace.export.BatchSpanProcessor`
+    The one thing that does touch models is :func:`_start_cache_warm`, and
+    nothing waits on it here. A restarted API asks the checkpoint cache which
+    models it had and rebuilds them behind the running server, so the working set
+    survives a restart without any of it being on the critical path to
+    ``/health``. When Redis is unreachable the answer is an empty list and
+    startup is exactly what it was before.
+
+    Shutdown stops that thread before it flushes the tracer — a warm-up nobody
+    is waiting for gets a bounded few seconds and no more, but it does get them,
+    because a daemon thread abandoned mid-load is what turns a clean exit into a
+    core dump. A :class:`~opentelemetry.sdk.trace.export.BatchSpanProcessor`
     holds spans in a queue, and without an explicit shutdown the last batch is
     lost on exit — which is precisely the tail of spans around a crash, the ones
     most worth having.
@@ -288,10 +367,13 @@ async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
         log_format=log_format,
         trace_exporter=exporter,
     )
+    warm_stop = threading.Event()
+    warm_thread = _start_cache_warm(get_registry(), warm_stop)
     try:
         yield
     finally:
         log.info("service_stopping")
+        _stop_cache_warm(warm_thread, warm_stop)
         shutdown_tracing()
 
 

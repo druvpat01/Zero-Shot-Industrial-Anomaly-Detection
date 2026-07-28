@@ -4,10 +4,13 @@ VENV := venv
 PY := $(VENV)/bin/python
 PIP := $(VENV)/bin/pip
 
+# requirements-dev.txt includes requirements.txt, so this is still the one
+# command that gives a developer a working environment. The container installs
+# requirements.txt alone; see docker/Dockerfile.
 setup:
 	python3 -m venv $(VENV)
 	$(PIP) install --upgrade pip
-	$(PIP) install -r requirements.txt
+	$(PIP) install -r requirements-dev.txt
 
 test:
 	$(VENV)/bin/pytest

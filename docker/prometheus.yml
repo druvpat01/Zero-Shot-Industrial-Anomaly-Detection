@@ -1,19 +1,24 @@
 # Prometheus scrape configuration for the defect-detection API.
 #
+# Mounted read-only into the prometheus service by docker-compose.yml, which
+# runs it through docker/prometheus-entrypoint.sh first — that script exists
+# only to substitute PROMETHEUS_SCRAPE_INTERVAL into the `scrape_interval`
+# below, because Prometheus does not expand environment variables in its config
+# and this file cannot be written to.
+#
+# To run it outside compose, against a server started with `make serve`, change
+# the target to localhost:8000 first (it is a compose service name below) and
+# then:
+#
 #   prometheus --config.file=docker/prometheus.yml
-#
-# or, from a container, mounted at the path Prometheus expects:
-#
-#   docker run --rm -p 9090:9090 \
-#     -v "$PWD/docker/prometheus.yml:/etc/prometheus/prometheus.yml" \
-#     --add-host=host.docker.internal:host-gateway \
-#     prom/prometheus
 #
 # The metrics themselves are defined in app/observability/metrics.py, and the
 # dashboard that reads them is docker/grafana/dashboards/defect_detection.json.
 
 global:
-  # 15s, matching the interval named in the build spec. Worth understanding
+  # 15s by default; docker/prometheus-entrypoint.sh rewrites this line from
+  # PROMETHEUS_SCRAPE_INTERVAL, and Grafana's datasource takes its `timeInterval`
+  # from the same variable so the two cannot drift. Worth understanding
   # rather than copying: this is the resolution limit of every rate() a
   # dashboard computes. Prometheus needs at least two samples in a window to
   # produce a rate at all, so the shortest usable range is 2x this (30s), and
@@ -45,13 +50,19 @@ scrape_configs:
     # with a network control instead — bind it to an internal interface, or
     # scrape through a sidecar.
     static_configs:
+      # The compose service name, resolved on the compose network — Prometheus
+      # scrapes from inside it, so this is not localhost:8000 even though that
+      # is where a human reaches the same endpoint. docker-compose.yml makes
+      # this service wait for the API to be *healthy* rather than merely
+      # started, so the target is UP on the first scrape rather than after a
+      # minute of connection-refused.
       - targets:
-          - localhost:8000
+          - api:8000
         labels:
           service: defect-detection
 
-    # `make serve` runs a single uvicorn worker, which is the case this file is
-    # written for. Under `uvicorn --workers N` each worker holds its own
+    # `make serve` and the container both run a single uvicorn worker, which is
+    # the case this file is written for. Under `uvicorn --workers N` each worker holds its own
     # counters and a scrape reaches whichever one the OS picks, so a counter
     # appears to jump backwards at random. Fix that by setting
     # PROMETHEUS_MULTIPROC_DIR on the server (app/observability/metrics.py

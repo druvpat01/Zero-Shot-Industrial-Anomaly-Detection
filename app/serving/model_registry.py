@@ -71,6 +71,21 @@ the process that knows which models exist and outlives any one request:
   It lives in memory only: a restart returns to the configured default, which is
   a real limitation and is why ``docs/evaluation.md`` says to write a fitted
   threshold into the environment once it is trusted.
+
+Surviving a restart
+===================
+Everything above is per-process, so a restart starts cold and the first request
+after a deploy pays a load it did not ask for. :mod:`app.serving.model_cache`
+takes the edge off: each load writes ``{backend, category, checkpoint_path,
+loaded_at}`` to Redis with an hour's TTL, and :meth:`ModelRegistry.warm_from_cache`
+reads that list back and rebuilds the same working set. The API calls it from a
+background thread at startup, so ``/health`` still answers immediately and the
+laziness contract above is intact — the difference is only that the warm-up is
+now speculative and free rather than charged to whoever asked first.
+
+The cache holds *metadata*, never weights, and is optional in the strong sense:
+if Redis is unreachable the registry logs a warning and behaves exactly as it did
+before it existed. That module's docstring has the reasoning.
 """
 
 from __future__ import annotations
@@ -91,6 +106,7 @@ from app.models.patchcore import PatchCoreModel
 from app.models.winclip import WinCLIPModel
 from app.observability.logging_config import get_logger
 from app.observability.metrics import set_models_loaded
+from app.serving.model_cache import CheckpointCache, LoadedModel, get_checkpoint_cache
 
 __all__ = ["ModelNotReadyError", "ModelRegistry", "ThresholdOutOfRangeError", "get_registry"]
 
@@ -201,6 +217,9 @@ class ModelRegistry:
             :class:`~app.evaluation.drift.ScoreDistributionMonitor` keeps. Passed
             through rather than read from the environment here so a test can make
             a monitor fill in a handful of scores.
+        cache: Where the "these models were loaded" records go. Defaults to the
+            process-wide :func:`~app.serving.model_cache.get_checkpoint_cache`.
+            Inject ``CheckpointCache(url="")`` to keep a test off any real Redis.
 
     Example:
         >>> registry = ModelRegistry()                              # doctest: +SKIP
@@ -216,11 +235,13 @@ class ModelRegistry:
         exported_dir: Path | str | None = None,
         warmup: bool = True,
         drift_window_size: int = DEFAULT_WINDOW_SIZE,
+        cache: CheckpointCache | None = None,
     ) -> None:
         self._config = config
         self._exported_dir = Path(exported_dir) if exported_dir is not None else None
         self._warmup = warmup
         self._drift_window_size = drift_window_size
+        self._cache = cache if cache is not None else get_checkpoint_cache()
 
         self._models: dict[tuple[str, str], AnomalyModel] = {}
         # Guards every dict below it, and nothing else. Held for microseconds.
@@ -425,6 +446,14 @@ class ModelRegistry:
                 calibrated=model.is_calibrated,
                 models_loaded=loaded_count,
             )
+
+            # After the model is cached and the event is logged, because it is
+            # the least important thing here: a cache write that fails must not
+            # turn a load that succeeded into a request that failed. The method
+            # is total (see app/serving/model_cache.py) so there is nothing to
+            # catch, but the ordering is the part that would still be right if
+            # that ever stopped being true.
+            self._cache.record(name, category, None if artifact is None else str(artifact))
             return model
 
     def _load(self, backend: str, category: str) -> AnomalyModel:
@@ -568,6 +597,116 @@ class ModelRegistry:
             category=category,
             duration_seconds=round(time.perf_counter() - started, 3),
         )
+
+    # -- restoring the working set across a restart -----------------------------
+
+    @property
+    def cache(self) -> CheckpointCache:
+        """The checkpoint-metadata cache backing :meth:`warm_from_cache`."""
+        return self._cache
+
+    def previously_loaded(self) -> list[LoadedModel]:
+        """What the cache says was resident before this process started.
+
+        Reads only — it loads nothing and is safe to call from a health or
+        diagnostic path. Entries already resident in *this* process are filtered
+        out, so on a warm process the list is what is still missing rather than
+        what exists.
+
+        Returns:
+            Records oldest-load-first, possibly empty. Empty is the normal answer
+            for a first-ever start, for a Redis that is down, and for a service
+            that has been idle longer than the cache's TTL — all three are fine,
+            and none of them is distinguishable here on purpose: the caller's
+            behaviour is the same.
+        """
+        return [entry for entry in self._cache.entries() if not self.is_loaded(entry.backend, entry.category)]
+
+    def warm_from_cache(self, stop: threading.Event | None = None) -> list[str]:
+        """Rebuild the working set the cache remembers. Returns the keys it loaded.
+
+        Called from a background thread at startup (see
+        :func:`app.serving.main.lifespan`), which is the only way this can exist
+        without breaking the promise ``/health`` makes: the loads happen while
+        the service is already answering, so a slow warm-up delays nothing and a
+        failed one degrades nothing.
+
+        Every failure mode is swallowed for the same reason. A record whose
+        artifact has been deleted since — the normal consequence of a deploy that
+        replaced a checkpoint — is dropped from the cache rather than retried on
+        every future restart, and anything else is logged and stepped over so one
+        bad entry cannot cost the rest of the set.
+
+        Args:
+            stop: Checked between models, so a shutdown that arrives partway
+                through stops after the current load rather than being ignored
+                for the remaining ones. A single load cannot be interrupted —
+                there is no safe point inside a torch deserialisation — which is
+                exactly why the granularity is per model and why the caller
+                joins with a timeout rather than unconditionally.
+
+        Returns:
+            The keys actually loaded, which may be shorter than the cache's list
+            if ``stop`` was set or an artifact had gone missing.
+        """
+        pending = self.previously_loaded()
+        if not pending:
+            return []
+
+        log.info(
+            "model_warm_start",
+            source="checkpoint_cache",
+            mode=self._cache.mode,
+            models=[entry.key for entry in pending],
+        )
+        started = time.perf_counter()
+        warmed: list[str] = []
+        for index, entry in enumerate(pending):
+            if stop is not None and stop.is_set():
+                # `remaining` is sliced by position rather than by len(warmed):
+                # a record that was skipped for a missing artifact advances the
+                # loop without adding to `warmed`, and reporting it as still
+                # pending would be a lie about what shutdown interrupted.
+                log.info(
+                    "model_warm_cancelled",
+                    warmed=warmed,
+                    remaining=[item.key for item in pending[index:]],
+                    reason="shutdown requested",
+                )
+                break
+            try:
+                self.get_model(entry.backend, entry.category)
+            except ModelNotReadyError as exc:
+                # The artifact went away between the two runs. Forget it: a
+                # record that cannot be reloaded is a failure paid at every
+                # restart from here to the end of time.
+                log.warning(
+                    "model_warm_skipped",
+                    backend=entry.backend,
+                    category=entry.category,
+                    checkpoint=entry.checkpoint_path,
+                    reason=exc.detail,
+                    action="dropped from the checkpoint cache",
+                )
+                self._cache.forget(entry.backend, entry.category)
+            except Exception as exc:  # noqa: BLE001 - a speculative warm-up may not take the process down
+                log.error(
+                    "model_warm_failed",
+                    backend=entry.backend,
+                    category=entry.category,
+                    error=type(exc).__name__,
+                    exc_info=True,
+                )
+            else:
+                warmed.append(entry.key)
+
+        log.info(
+            "model_warm_complete",
+            warmed=warmed,
+            requested=len(pending),
+            duration_seconds=round(time.perf_counter() - started, 3),
+        )
+        return warmed
 
     # -- drift monitoring ------------------------------------------------------
 

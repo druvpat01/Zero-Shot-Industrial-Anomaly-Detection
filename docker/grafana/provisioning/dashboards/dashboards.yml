@@ -1,0 +1,28 @@
+# Where Grafana finds the dashboards to load at startup.
+#
+# The path below is *not* the repo directory. docker-compose.yml mounts
+# ./docker/grafana/dashboards read-only at /etc/grafana/dashboards-src, and
+# docker/grafana/entrypoint.sh renders those files here after binding their
+# ${DS_PROMETHEUS} datasource input. That indirection is explained in the
+# entrypoint script.
+apiVersion: 1
+
+providers:
+  - name: defect-detection
+    orgId: 1
+    folder: Defect Detection
+    type: file
+    # A dashboard deleted from the repo should disappear from Grafana too;
+    # otherwise the UI accumulates panels no file explains.
+    disableDeletion: false
+    # Rescan while running, so editing the JSON in the repo and saving is enough
+    # to see the change — no container restart in the edit loop.
+    updateIntervalSeconds: 30
+    # Edits in the UI are allowed and are the intended way to iterate on a
+    # panel; they are overwritten on the next rescan if the file changes, which
+    # is the right precedence for a dashboard that is checked in. Export the
+    # JSON back into docker/grafana/dashboards/ to keep a change.
+    allowUiUpdates: true
+    options:
+      path: /var/lib/grafana/dashboards
+      foldersFromFilesStructure: false

@@ -1,0 +1,32 @@
+# The Prometheus that Grafana reads. Provisioned rather than clicked, so a fresh
+# `docker compose up` gives a working dashboard with no setup steps — which is
+# the claim the README's quickstart makes.
+apiVersion: 1
+
+datasources:
+  - name: Prometheus
+    type: prometheus
+    # Load-bearing, and it appears in two other places: docker/grafana/entrypoint.sh
+    # substitutes it for the dashboard's ${DS_PROMETHEUS} input, and the panels
+    # reference it by uid rather than by name. Change it here and it must change
+    # in the entrypoint too, or every panel loses its datasource.
+    uid: defect-prometheus
+    access: proxy
+    # The compose service name. Grafana proxies queries from the server side, so
+    # this resolves on the compose network and not in the operator's browser —
+    # which is why it is not localhost:9090 even though that is where a human
+    # reaches Prometheus.
+    url: http://prometheus:9090
+    isDefault: true
+    # Provisioned files are the source of truth: a change made in the UI would
+    # be silently reverted on the next restart, and a setting that only appears
+    # to work is worse than one that is plainly read-only.
+    editable: false
+    jsonData:
+      # Grafana's minimum step, and it must match what Prometheus actually
+      # scrapes at: set it lower and $__rate_interval asks for resolution the
+      # TSDB does not have, producing gaps that look like an outage. Interpolated
+      # from the same variable that configures the scrape itself, so the two
+      # cannot drift apart.
+      timeInterval: ${PROMETHEUS_SCRAPE_INTERVAL}
+      httpMethod: POST

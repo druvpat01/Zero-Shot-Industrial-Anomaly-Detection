@@ -1,0 +1,34 @@
+# Everything a developer needs on top of what the service needs to run.
+#
+#   pip install -r requirements-dev.txt      # == `make setup`
+#
+# The split exists for the container: docker/Dockerfile installs
+# requirements.txt only, so pytest, ruff and pyarrow are not in the runtime
+# image. Nothing here is imported by app/ — if something in this file ever
+# becomes an import under app/, it belongs in requirements.txt instead, and the
+# container will say so by failing on a missing module rather than by silently
+# working in dev and breaking in production.
+-r requirements.txt
+
+# Testing
+pytest
+pytest-asyncio
+# Starlette's TestClient transport. tests/test_api.py is the only user;
+# scripts/run_api_demo.py deliberately uses urllib against a real socket instead.
+httpx
+
+# Lint. `make lint` prefers this and falls back to flake8 if it is absent, so it
+# is listed rather than assumed to be on the developer's PATH.
+ruff
+
+# ONNX graph surgery for the INT8 export path. `onnx` is a runtime dependency of
+# onnxruntime.quantization.quantize_dynamic (scripts/export_onnx.py, and the
+# quantization test); onnxruntime does not pull it in itself. Serving an exported
+# graph needs only onnxruntime, so this is a training-box dependency, not a
+# container one.
+onnx
+
+# Dataset acquisition. scripts/download_dataset.py's `hf-datasets` source — one
+# of three, and not the default, which is why the container does without it. It
+# drags in pyarrow (~150 MB) and nothing under app/ imports it.
+datasets

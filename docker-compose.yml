@@ -1,0 +1,185 @@
+# The whole system: the API, the cache it remembers its working set in, and the
+# two services that watch it.
+#
+#   cp .env.example .env
+#   docker compose up --build
+#   python scripts/run_api_demo.py --base-url http://localhost:8000
+#
+#   API        http://localhost:8000/docs
+#   Prometheus http://localhost:9090/targets
+#   Grafana    http://localhost:3000   (admin / $GRAFANA_ADMIN_PASSWORD)
+#
+# `.env` is required, not optional, and compose will refuse to start without it.
+# That is the friendlier failure: the API fails *closed* when no API keys are
+# configured (see app/serving/auth.py), so a stack that came up without one would
+# start cleanly and then 503 every request, which is a much longer walk to the
+# same answer.
+#
+# Startup ordering
+# ================
+# `depends_on` on its own only waits for a container to *start*, which for this
+# stack is worth almost nothing: the API process exists ~15 s before it can
+# answer anything, because it has to import torch and anomalib first. So every
+# edge here is a `service_healthy` condition, and the chain is
+#
+#   redis -> api -> prometheus -> grafana
+#
+# Prometheus waiting for the API to be *healthy* is the one that matters: a
+# scrape against a target that is not listening yet is a scrape error, and the
+# first thing anybody does after `docker compose up` is open /targets and read
+# it as a verdict on the whole stack. Grafana waits on Prometheus for the same
+# reason — a dashboard whose datasource was unreachable at provisioning time
+# looks broken in a way that has nothing to do with the service being watched.
+
+name: defect-detection
+
+services:
+  api:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile
+    image: defect-detection-api:local
+    # Everything in .env: API keys, thresholds, model configuration. The few
+    # values below override it, because .env is written for `make serve` on a
+    # laptop and those are the settings that differ inside a container.
+    env_file:
+      - .env
+    environment:
+      # `localhost` in .env means the developer's own machine; in here it would
+      # mean this container.
+      REDIS_URL: redis://redis:6379/0
+      # One JSON object per line, for a log shipper to index. The console
+      # renderer's colour codes are for a terminal, and `docker compose logs` is
+      # not reliably one.
+      LOG_FORMAT: json
+      # Every path in .env is relative (./data, ./results) and the container's
+      # working directory is /app, so they resolve onto the volumes below
+      # without being restated here. The exception is the audit trail, named
+      # explicitly because it is the one file whose loss is not recoverable by
+      # re-running something.
+      AUDIT_LOG_PATH: /app/results/audit.jsonl
+      # A span per request on stderr, in a container, at production volume, is
+      # a lot of bytes for something nothing is collecting. Point
+      # OTEL_EXPORTER_OTLP_ENDPOINT at a collector and this becomes `otlp`.
+      OTEL_TRACES_EXPORTER: none
+    ports:
+      - "8000:8000"
+    volumes:
+      # Read-only: the models read training and evaluation images from here and
+      # have no business writing to a dataset. It is also the cheapest possible
+      # guard against a bug in the benchmark path overwriting ground truth.
+      - ./data:/app/data:ro
+      # Read-write: checkpoints, ONNX exports, benchmark JSON and the audit log.
+      # A bind mount rather than a named volume so `scripts/train_patchcore.py`
+      # on the host and the container are looking at the same files — that is
+      # the whole workflow this project has.
+      - ./results:/app/results
+      # Downloaded backbone weights (WinCLIP's ~830 MB of CLIP, PatchCore's
+      # WideResNet). A named volume because these are neither source nor output:
+      # nobody wants them in the repo, and nobody wants to download them again
+      # on every `docker compose up`.
+      - model-cache:/home/appuser/.cache
+    depends_on:
+      redis:
+        condition: service_healthy
+    # The HEALTHCHECK comes from the image (docker/Dockerfile) rather than being
+    # restated here, so `docker run` on the image alone behaves identically.
+    restart: unless-stopped
+
+  redis:
+    image: redis:7-alpine
+    # Persistence off, deliberately. What is stored is checkpoint *metadata*
+    # with a one-hour TTL — which models were loaded, so a restarted API can
+    # rebuild its working set — and an RDB snapshot of an hour-lived cache is
+    # work done to preserve records that will have expired before anyone reads
+    # them. `allkeys-lru` and a small ceiling for the same reason: this is a
+    # cache, and a cache that can fill a disk is a liability, not a feature.
+    command: redis-server --save "" --appendonly no --maxmemory 128mb --maxmemory-policy allkeys-lru
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+      start_period: 5s
+    restart: unless-stopped
+    # No published port. Nothing outside this network needs to reach it, and a
+    # Redis on 0.0.0.0:6379 with no password is the internet's favourite thing
+    # to find. `docker compose exec redis redis-cli` is the way in.
+    expose:
+      - "6379"
+
+  prometheus:
+    image: prom/prometheus:latest
+    volumes:
+      - ./docker/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ./docker/prometheus-entrypoint.sh:/usr/local/bin/prometheus-entrypoint.sh:ro
+      - prometheus-data:/prometheus
+    environment:
+      # Read by the entrypoint script, which renders the mounted config before
+      # exec'ing prometheus — the config file is mounted read-only and
+      # Prometheus does not expand environment variables itself.
+      PROMETHEUS_SCRAPE_INTERVAL: ${PROMETHEUS_SCRAPE_INTERVAL:-15s}
+    entrypoint: ["/bin/sh", "/usr/local/bin/prometheus-entrypoint.sh"]
+    command:
+      - --storage.tsdb.path=/prometheus
+      - --storage.tsdb.retention.time=15d
+      - --web.enable-lifecycle
+    ports:
+      - "9090:9090"
+    depends_on:
+      api:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "wget", "--quiet", "--tries=1", "--spider", "http://localhost:9090/-/healthy"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    restart: unless-stopped
+
+  grafana:
+    image: grafana/grafana:latest
+    environment:
+      GF_SECURITY_ADMIN_USER: ${GRAFANA_ADMIN_USER:-admin}
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_ADMIN_PASSWORD:-admin}
+      # Nobody signs up to a dashboard that is provisioned from a git repo.
+      GF_USERS_ALLOW_SIGN_UP: "false"
+      GF_ANALYTICS_REPORTING_ENABLED: "false"
+      GF_ANALYTICS_CHECK_FOR_UPDATES: "false"
+      # Interpolated into the provisioned datasource's `timeInterval`, so
+      # Grafana's minimum step matches what Prometheus actually collects at.
+      # Set them apart and every rate() either interpolates or aliases.
+      PROMETHEUS_SCRAPE_INTERVAL: ${PROMETHEUS_SCRAPE_INTERVAL:-15s}
+    volumes:
+      # The dashboard as it is checked in — a Grafana *export*, with a
+      # `${DS_PROMETHEUS}` datasource input, so it can also be imported by hand
+      # into any other Grafana. File provisioning cannot answer that input, so
+      # the entrypoint renders it against the provisioned datasource's uid.
+      # Mounted read-only; the rendered copy goes to Grafana's own data dir.
+      - ./docker/grafana/dashboards:/etc/grafana/dashboards-src:ro
+      - ./docker/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./docker/grafana/entrypoint.sh:/usr/local/bin/grafana-entrypoint.sh:ro
+      - grafana-data:/var/lib/grafana
+    entrypoint: ["/bin/sh", "/usr/local/bin/grafana-entrypoint.sh"]
+    ports:
+      - "3000:3000"
+    depends_on:
+      prometheus:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "--silent", "http://localhost:3000/api/health"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 15s
+    restart: unless-stopped
+
+volumes:
+  # Prometheus' TSDB and Grafana's sqlite. Named volumes rather than bind
+  # mounts: they are databases with their own on-disk formats, owned by users
+  # that only exist inside those images (nobody:65534 and grafana:472), and
+  # bind-mounting them into a repo is how you get a permission error on
+  # `docker compose up` and a directory git wants to track.
+  prometheus-data:
+  grafana-data:
+  model-cache:

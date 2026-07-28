@@ -22,26 +22,72 @@ _Placeholder — to be filled in as components land._
 - **Guardrails** — input frame quality validation before inference.
 - **Serving** — FastAPI routes, schemas, and session management.
 - **Observability** — structured logging, Prometheus metrics, and tracing.
+- **Deployment** — a four-service compose stack (api, redis, prometheus,
+  grafana) built from [`docker/`](docker/); see the Quickstart.
 
 ## Quickstart
 
+Three commands, no Python on the host:
+
 ```bash
-# Create the virtual environment and install dependencies
-make setup
-
-# Verify the environment
-python -c "import anomalib, fastapi, torch, cv2; print('env ok')"
-
-# Run the test suite
-make test
-
-# Start the API server
-make serve
+git clone <repo> && cd defect-detection
+cp .env.example .env
+docker compose up --build
 ```
 
-Copy `.env.example` to `.env` and adjust configuration as needed.
+Then, from a second terminal:
 
-`.env` is also where API keys live. Every endpoint except `/health` is gated by
+```bash
+docker compose exec api python scripts/run_api_demo.py --base-url http://localhost:8000
+```
+
+That scores five real MVTec bottle frames — three defective, two clean — through
+`POST /predict` over HTTP and asserts every defect outscored every clean part.
+The demo runs *inside* the api container because it imports `app/` to find the
+sample images and read the API keys; from the host it is the same line, after a
+`make setup` to build the venv it needs. Nothing else is required either way:
+the image carries every dependency, and `.env.example` ships working development
+keys.
+
+| | | |
+|---|---|---|
+| API | <http://localhost:8000/docs> | OpenAPI, and `GET /health` for liveness |
+| Prometheus | <http://localhost:9090/targets> | the `defect-detection` target, UP |
+| Grafana | <http://localhost:3000> | `admin` / `$GRAFANA_ADMIN_PASSWORD` |
+
+The Grafana dashboard is provisioned, not imported by hand — it is under
+**Dashboards → Defect Detection → Defect Detection — Inference** on first load,
+already pointed at the Prometheus that is already scraping the API.
+
+Four services, and what each is for:
+
+| Service | Why it is in the stack |
+|---|---|
+| `api` | The FastAPI app, built from [`docker/Dockerfile`](docker/Dockerfile). `./data` is mounted read-only (models read images, and nothing should write to a dataset); `./results` read-write, so checkpoints, benchmark JSON and the audit log outlive the container. |
+| `redis` | Remembers which models were loaded — metadata only, one-hour TTL — so a restarted API rebuilds its working set instead of making the next caller pay a cold load. Optional: with it down, the API logs a warning and behaves exactly as before. |
+| `prometheus` | Scrapes `GET /metrics`. Waits for the api container to be *healthy*, not merely started, so the first scrape lands on a listening socket. |
+| `grafana` | Renders [the dashboard](docker/grafana/dashboards/defect_detection.json) against a provisioned datasource. |
+
+`docker compose down` stops it; add `-v` to discard the Prometheus history, the
+Grafana database and the cached backbone weights along with it.
+
+If your Docker predates Compose V2, the command is the hyphenated
+`docker-compose`; everything else is identical.
+
+### Working on it locally
+
+```bash
+make setup     # venv + requirements-dev.txt (runtime deps, plus pytest/ruff/onnx)
+make test
+make serve     # uvicorn on :8000, without the container
+```
+
+`requirements.txt` is the runtime set and the only thing the image installs;
+`requirements-dev.txt` includes it and adds the tooling. Keeping them apart is
+most of how the image stays under 2 GB — that, and installing CPU-only torch,
+which is the difference between a 1.7 GB image and a 6 GB one.
+
+`.env` is where API keys live. Every endpoint except `/health` is gated by
 an `X-API-Key` header, and a server with no keys configured refuses them all with
 `503 auth_not_configured` — set `VIEWER_API_KEYS` and `OPERATOR_API_KEYS` before
 `make serve`. `/health` stays open for liveness probes.
@@ -124,13 +170,18 @@ Five application metrics are exported: `images_processed_total`,
 unauthenticated so a Prometheus server can scrape it without holding a
 credential — protect it with a network control, not a key.
 
-Ready-made monitoring config lives in [`docker/`](docker/):
+`docker compose up` brings the scraper and the dashboard up with the service, so
+this needs no setup — but the config is ordinary and works standalone too:
 
 ```bash
-prometheus --config.file=docker/prometheus.yml
-# then import docker/grafana/dashboards/defect_detection.json into Grafana
+# Already running as part of the stack; this is the same config, by hand
+prometheus --config.file=docker/prometheus.yml   # retarget localhost:8000 first
+# or import docker/grafana/dashboards/defect_detection.json into any Grafana
 ```
 
 The dashboard has four panels — requests/sec, p50/p95 inference latency, guard
-rejection rate by reason, and model backend distribution — and prompts for a
-Prometheus datasource on import.
+rejection rate by reason, and model backend distribution. It is kept in Grafana's
+portable export form, with a `${DS_PROMETHEUS}` datasource input, so importing it
+by hand prompts for a datasource; under compose,
+[`docker/grafana/entrypoint.sh`](docker/grafana/entrypoint.sh) binds that input
+to the provisioned Prometheus instead.

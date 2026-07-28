@@ -1,11 +1,22 @@
+# What the *service* needs to answer a request, and nothing else.
+#
+# This file is the container's dependency set: docker/Dockerfile installs it and
+# nothing more, which is most of how the runtime image stays under 2 GB. Test,
+# lint and dataset-acquisition tooling lives in requirements-dev.txt, which
+# includes this file — so `pip install -r requirements-dev.txt` (what `make
+# setup` does) still gives a developer everything, and the split costs nobody
+# an extra step.
+#
+# Two things here are *not* pinned in this file and matter more than anything
+# that is: the container installs torch and torchvision from PyTorch's CPU wheel
+# index first, so the CUDA build's ~2.7 GB of bundled nvidia libraries never
+# lands in the image. See the note in docker/Dockerfile.
+
 # Core anomaly detection
 anomalib
 torch
 torchvision
 onnxruntime
-# `onnx` is a runtime dependency of onnxruntime.quantization.quantize_dynamic
-# (INT8 export in scripts/export_onnx.py); onnxruntime does not pull it in itself.
-onnx
 
 # CLIP backbone for WinCLIP (anomalib's `clip` extra). The upper bound is
 # anomalib's own and it is load-bearing: from 2.26 open_clip's transformer
@@ -21,7 +32,16 @@ uvicorn[standard]
 pydantic>=2.0
 
 # Vision / numerics
-opencv-python
+#
+# `-headless` rather than plain opencv-python, for two reasons. It is the build
+# anomalib itself depends on, and installing both puts two packages in the image
+# that each own the `cv2` import name — whichever pip unpacks last wins, which is
+# not a thing to leave to chance. And the GUI build links libGL, which
+# python:3.11-slim does not ship: the non-headless wheel turns `import cv2` into
+# an ImportError inside the container unless ~100 MB of X11 libraries are
+# installed to satisfy an interactive window nobody can see. Nothing in this
+# repo calls cv2.imshow; the plots are matplotlib's.
+opencv-python-headless
 numpy
 scikit-learn
 # Declared explicitly rather than leaned on as a scikit-learn transitive: this
@@ -32,8 +52,9 @@ scipy
 matplotlib
 Pillow
 
-# Datasets
-datasets
+# Model-hub client. Runtime, not tooling: WinCLIP's backbone weights are fetched
+# through it on first use, which is what makes the zero-shot backend work in a
+# container with no checkpoint mounted.
 huggingface_hub
 
 # Observability
@@ -51,10 +72,11 @@ opentelemetry-api
 # opentelemetry-exporter-otlp-proto-http
 
 # Infra
+#
+# redis backs app/serving/model_cache.py, which remembers which models were
+# loaded so a restarted API can rebuild its working set. It is optional at
+# runtime — the cache degrades to an in-process dict — but the client is a
+# declared dependency rather than an optional import, because "the feature is
+# off because a package is missing" is a worse failure than any it prevents.
 redis
 python-dotenv
-
-# Testing
-pytest
-pytest-asyncio
-httpx

@@ -1,0 +1,62 @@
+# What never reaches the Docker daemon.
+#
+# This file is mostly a performance and correctness measure, and the two biggest
+# entries are the reason it exists at all: `venv/` is ~6 GB and `results/` is
+# ~1.5 GB of checkpoints and ONNX graphs. Without this, every `docker build`
+# would upload all of it as build context before running a single instruction —
+# and `results/` would then be *baked into* the image as well as mounted over it
+# at runtime, which is a silent way to ship a stale checkpoint.
+
+# Local environments
+venv/
+.venv/
+env/
+
+# Data and artifacts. Both arrive as volumes (see docker-compose.yml): the
+# dataset read-only, the results directory read-write, so checkpoints and audit
+# logs outlive the container.
+data/
+results/
+
+# Secrets. The image must never contain a .env — the app reads <repo>/.env only
+# as a fallback, and compose injects the real values as environment variables.
+# A .env baked into a layer is a credential in a registry.
+.env
+.env.*
+!.env.example
+
+# Version control and CI
+.git/
+.gitignore
+.github/
+
+# Python noise
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+*.egg-info/
+
+# Model artifacts, wherever they turn up
+*.ckpt
+*.pt
+*.onnx
+
+# Development-only material
+notebooks/
+tests/
+docs/
+Makefile
+requirements-dev.txt
+defect_detection_build_prompts.md
+
+# The observability stack's own configuration is mounted into the prometheus and
+# grafana containers, not copied into the API image.
+docker/prometheus.yml
+docker/grafana/
+
+# Editor / OS cruft
+.DS_Store
+.idea/
+.vscode/
