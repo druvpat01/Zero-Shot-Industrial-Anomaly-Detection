@@ -187,6 +187,7 @@ from app.serving.model_registry import (
 from app.serving.schemas import (
     BenchmarkRequest,
     BenchmarkResponse,
+    CacheStatus,
     CalibrationRequest,
     CalibrationResponse,
     DriftStatus,
@@ -578,11 +579,22 @@ def health(registry: ModelRegistry = Depends(get_registry)) -> HealthResponse:
     Unauthenticated on purpose, and it is the *only* such endpoint. A kubelet
     probe cannot hold an API key, and a health check that can fail closed on a
     credential problem is a health check that will eventually restart a perfectly
-    healthy pod. What it discloses is bounded to match: liveness and the names of
-    resident models, which is strictly less than an anonymous caller learns from
-    the port being open at all.
+    healthy pod. What it discloses is bounded to match: liveness, the names of
+    resident models, and whether the checkpoint cache found its Redis — which is
+    strictly less than an anonymous caller learns from the port being open at
+    all. The cache status carries no URL for exactly that reason; see
+    :meth:`app.serving.model_cache.CheckpointCache.status`.
+
+    Still cheap enough to be a kubelet probe. The one call here that can touch
+    the network is the cache's connection check, which is a lock and an attribute
+    read once connected, and otherwise at most one 0.5 s attempt every 30 s —
+    inside the probe's timeout either way.
     """
-    return HealthResponse(status="ok", models_loaded=registry.loaded_keys())
+    return HealthResponse(
+        status="ok",
+        models_loaded=registry.loaded_keys(),
+        cache=CacheStatus(**registry.cache.status()),
+    )
 
 
 @app.get("/metrics", tags=["ops"], include_in_schema=False)

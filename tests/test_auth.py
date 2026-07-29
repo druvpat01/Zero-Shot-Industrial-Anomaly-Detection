@@ -49,6 +49,7 @@ from app.serving.auth import (
     require_role,
 )
 from app.serving.main import app
+from app.serving.model_cache import CheckpointCache
 from app.serving.model_registry import get_registry
 
 CATEGORY = "widget"
@@ -127,6 +128,11 @@ class StubRegistry:
         self.config = config
         self._model = StubModel(config=config)
         self._monitors: dict[tuple[str, str], ScoreDistributionMonitor] = {}
+        # ``/health`` reports the checkpoint cache's connection state. The empty
+        # URL is the seam documented in app.serving.model_cache: fallback mode,
+        # chosen without reading the environment, so this stub stays as offline
+        # as the rest of it and cannot reach a developer's real Redis.
+        self.cache = CheckpointCache(url="")
 
     def get_model(self, backend: str, category: str) -> AnomalyModel:
         return self._model

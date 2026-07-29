@@ -33,6 +33,7 @@ __all__ = [
     "MODEL_BACKENDS",
     "BenchmarkRequest",
     "BenchmarkResponse",
+    "CacheStatus",
     "CalibrationMetric",
     "CalibrationRequest",
     "CalibrationResponse",
@@ -201,8 +202,40 @@ class BenchmarkResponse(BaseModel):
     )
 
 
+class CacheStatus(BaseModel):
+    """Whether the checkpoint cache is on Redis or on its in-process fallback.
+
+    Both are working states — see :mod:`app.serving.model_cache`, where Redis is
+    optional by design — so this is reported as configuration rather than folded
+    into ``status``. ``connected: false`` means the warm set will not survive a
+    restart, not that the service is unwell.
+
+    No URL here on purpose: this rides on unauthenticated ``GET /health``, and an
+    internal hostname is a piece of the deployment's map that liveness does not
+    need to give away.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    backend: str = Field(
+        description="'redis' when a live client is held, 'memory' for the in-process fallback dict.",
+        examples=["redis"],
+    )
+    connected: bool = Field(description="Whether Redis answered a PING.")
+    ttl_seconds: int = Field(
+        description="Lifetime of one cached record, identical in both modes.",
+        examples=[3600],
+    )
+    detail: str | None = Field(
+        default=None,
+        description="Short reason the cache is not on Redis (unset URL, unreachable, a "
+        "failed command). Null when connected.",
+        examples=[None],
+    )
+
+
 class HealthResponse(BaseModel):
-    """Liveness, and what the process currently holds in memory.
+    """Liveness, what the process currently holds in memory, and where it remembers it.
 
     Deliberately cheap: answering this must never load a model, so
     ``models_loaded`` reports what is already resident rather than what could be
@@ -216,6 +249,11 @@ class HealthResponse(BaseModel):
         description="Currently resident models as '<backend>:<category>' keys. Empty "
         "right after startup, because loading is lazy.",
         examples=[["patchcore:bottle"]],
+    )
+    cache: CacheStatus = Field(
+        description="Checkpoint-cache connection state. Reported here rather than from its "
+        "own endpoint so a dashboard's liveness poll answers 'is Redis up?' in the same "
+        "request — see CacheStatus for why it is not a verdict on health.",
     )
 
 

@@ -1,0 +1,31 @@
+# What `dashboard.py` needs, and deliberately nothing else.
+#
+# Its own file rather than a block in requirements.txt, because the whole point
+# of the dashboard service is that it is *not* the API: it runs on a stock
+# `python:3.11-slim` and installs this list at start, which takes seconds and
+# ~200 MB. Folding these into requirements.txt would put streamlit in the API
+# image; pointing the dashboard at requirements.txt would put torch, anomalib and
+# onnxruntime in a process that only ever calls `requests.post`.
+#
+# The dashboard imports nothing from `app/`. See the module docstring in
+# dashboard.py for why that constraint is load-bearing rather than tidy.
+
+# >=1.37 for st.fragment(run_every=...), which is what makes the System Health
+# tab refresh in place instead of resetting the tab selection every 10 s. There
+# is a sleep-and-rerun fallback for older versions, but it is a worse demo, and
+# nothing here needs to run on an older Streamlit.
+streamlit>=1.37,<2
+
+# The HTTP client, which is the entire integration with the service.
+requests>=2.31
+
+# Imported directly (the AU-PRO bar chart, the JET colorbar), so pinned here
+# rather than leaned on as a streamlit transitive.
+matplotlib>=3.7
+
+# Also direct imports: the frame/heatmap blend is numpy arithmetic, decoding is
+# Pillow, and the two results tables are DataFrames. pandas and numpy do arrive
+# with streamlit, but a dependency you import is a dependency you declare.
+numpy>=1.24
+pandas>=2.0
+Pillow>=10.0

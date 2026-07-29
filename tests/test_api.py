@@ -187,6 +187,22 @@ def test_health_returns_200(client: TestClient) -> None:
     assert isinstance(body["models_loaded"], list)
 
 
+def test_health_reports_the_checkpoint_cache(client: TestClient) -> None:
+    """The cache block is what the dashboard's Redis tile reads.
+
+    Asserted on shape and on one absence: no key here may carry the connection
+    URL, because this endpoint is the only unauthenticated one in the service and
+    its disclosure is deliberately bounded to liveness.
+    """
+    cache = client.get("/health").json()["cache"]
+
+    assert cache["backend"] in {"redis", "memory"}
+    assert isinstance(cache["connected"], bool)
+    assert cache["connected"] is (cache["backend"] == "redis")
+    assert isinstance(cache["ttl_seconds"], int)
+    assert "redis://" not in str(cache)
+
+
 def test_health_loads_no_models(client: TestClient, override_registry, tmp_path: Path) -> None:
     """Health must not trigger a model load — the whole reason loading is lazy.
 

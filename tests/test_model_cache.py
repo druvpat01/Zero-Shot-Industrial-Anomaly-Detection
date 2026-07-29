@@ -176,6 +176,61 @@ def test_get_checkpoint_cache_is_the_same_object_every_time() -> None:
 
 
 # ---------------------------------------------------------------------------
+# status(), which GET /health reports
+# ---------------------------------------------------------------------------
+
+
+def test_status_of_an_unconfigured_cache_says_memory_and_why(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The dashboard's Redis tile has to distinguish 'off' from 'broken'."""
+    monkeypatch.delenv("REDIS_URL", raising=False)
+    cache = CheckpointCache(use_dotenv=False)
+
+    status = cache.status()
+
+    assert status["backend"] == "memory"
+    assert status["connected"] is False
+    assert status["ttl_seconds"] == cache.ttl_seconds
+    assert "REDIS_URL" in str(status["detail"])
+
+
+def test_status_of_an_unreachable_redis_reports_it_without_the_url() -> None:
+    """The detail names the failure, never the host.
+
+    This rides on unauthenticated ``GET /health``, so the assertion is as much
+    about what is *absent* as what is present: an error message that echoed the
+    connection string would publish an internal hostname to anyone who can reach
+    the port.
+    """
+    cache = CheckpointCache(url="redis://127.0.0.1:1/0")
+
+    status = cache.status()
+
+    assert status["connected"] is False
+    assert "unreachable" in str(status["detail"])
+    assert "127.0.0.1" not in str(status["detail"])
+
+
+def test_status_does_not_re_probe_on_every_call() -> None:
+    """Cheap enough to poll: a dead Redis costs one attempt per cooldown, not one per call.
+
+    Asserted through the clock rather than by counting connections, because it is
+    the wall-clock cost that decides whether a 10 s dashboard refresh is
+    reasonable. Port 1 refuses immediately, so the first call is fast too — what
+    would show up here is a *repeated* connect attempt, which on a host that
+    blackholes instead of refusing would be the socket timeout every time.
+    """
+    cache = CheckpointCache(url="redis://127.0.0.1:1/0")
+    cache.status()
+
+    started = time.perf_counter()
+    for _ in range(20):
+        cache.status()
+    elapsed = time.perf_counter() - started
+
+    assert elapsed < 0.5
+
+
+# ---------------------------------------------------------------------------
 # What the registry does with it
 # ---------------------------------------------------------------------------
 

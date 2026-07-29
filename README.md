@@ -22,8 +22,8 @@ _Placeholder — to be filled in as components land._
 - **Guardrails** — input frame quality validation before inference.
 - **Serving** — FastAPI routes, schemas, and session management.
 - **Observability** — structured logging, Prometheus metrics, and tracing.
-- **Deployment** — a four-service compose stack (api, redis, prometheus,
-  grafana) built from [`docker/`](docker/); see the Quickstart.
+- **Deployment** — a five-service compose stack (api, redis, prometheus,
+  grafana, dashboard) built from [`docker/`](docker/); see the Quickstart.
 
 ## Quickstart
 
@@ -51,18 +51,25 @@ keys.
 
 | | | |
 |---|---|---|
+| Dashboard | <http://localhost:8501> | upload a frame, see the verdict and the heatmap |
 | API | <http://localhost:8000/docs> | OpenAPI, and `GET /health` for liveness |
 | Prometheus | <http://localhost:9090/targets> | the `defect-detection` target, UP |
 | Grafana | <http://localhost:3000> | `admin` / `$GRAFANA_ADMIN_PASSWORD` |
+
+The dashboard is the one to open first if you want to see what this does rather
+than read about it: drop in an image, get a verdict, a localisation heatmap and a
+latency. [`docs/demo_script.md`](docs/demo_script.md) is a seven-step script for
+walking somebody else through it in three minutes.
 
 The Grafana dashboard is provisioned, not imported by hand — it is under
 **Dashboards → Defect Detection → Defect Detection — Inference** on first load,
 already pointed at the Prometheus that is already scraping the API.
 
-Four services, and what each is for:
+Five services, and what each is for:
 
 | Service | Why it is in the stack |
 |---|---|
+| `dashboard` | [`dashboard.py`](dashboard.py) — a Streamlit client on a stock `python:3.11-slim`, because it imports nothing from `app/` and needs none of the API's ~1.8 GB of dependencies. Three tabs: score a frame, compare backends, watch the live metrics. |
 | `api` | The FastAPI app, built from [`docker/Dockerfile`](docker/Dockerfile). `./data` is mounted read-only (models read images, and nothing should write to a dataset); `./results` read-write, so checkpoints, benchmark JSON and the audit log outlive the container. |
 | `redis` | Remembers which models were loaded — metadata only, one-hour TTL — so a restarted API rebuilds its working set instead of making the next caller pay a cold load. Optional: with it down, the API logs a warning and behaves exactly as before. |
 | `prometheus` | Scrapes `GET /metrics`. Waits for the api container to be *healthy*, not merely started, so the first scrape lands on a listening socket. |

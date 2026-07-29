@@ -234,6 +234,9 @@ class CheckpointCache:
         self._client: object | None = None
         self._probe_after = 0.0
         self._announced_disabled = False
+        #: Why the cache is not on Redis, for :meth:`status` to report. A short
+        #: slug, never the URL — see that method for why the distinction matters.
+        self._disabled_reason: str | None = None
         #: key -> (payload, monotonic expiry). The fallback's whole job is to
         #: behave like the Redis one, TTL included.
         self._fallback: dict[str, tuple[str, float]] = {}
@@ -255,6 +258,40 @@ class CheckpointCache:
     @property
     def ttl_seconds(self) -> int:
         return self._ttl_seconds
+
+    def status(self) -> dict[str, object]:
+        """Connection state, cheap enough for a health endpoint to poll.
+
+        Unlike :attr:`mode`, this *does* connect — it is the difference between
+        "no client is held" and "Redis is unreachable", and a status field that
+        cannot tell those apart reports a healthy stack as degraded for the whole
+        window before the first model load. The cost is bounded by the same two
+        constants every other caller relies on: an established client is a lock
+        and an attribute read, and an absent one is at most one connect attempt
+        per :data:`RETRY_AFTER_SECONDS`, capped at
+        :data:`SOCKET_TIMEOUT_SECONDS`. A 10 s dashboard refresh therefore costs
+        nothing in the normal case and 0.5 s twice a minute in the worst one.
+
+        Returns:
+            ``backend`` (``"redis"``/``"memory"``), ``connected``,
+            ``ttl_seconds``, and ``detail`` — a short reason when not connected.
+
+        Note:
+            The URL is deliberately **not** included. This is surfaced on
+            unauthenticated ``GET /health``, whose disclosure is bounded to
+            liveness by design, and an internal hostname is a free piece of the
+            deployment's map. ``checkpoint_cache_connected`` in the logs carries
+            the (redacted) URL for anyone who is entitled to it.
+        """
+        client = self._client_or_none()
+        with self._lock:
+            reason = self._disabled_reason
+        return {
+            "backend": "redis" if client is not None else "memory",
+            "connected": client is not None,
+            "ttl_seconds": self._ttl_seconds,
+            "detail": None if client is not None else (reason or "not connected"),
+        }
 
     # -- connection ------------------------------------------------------------
 
@@ -311,10 +348,15 @@ class CheckpointCache:
                     impact="model loads still work; the warm set will not survive a restart",
                     retry_in_seconds=RETRY_AFTER_SECONDS,
                 )
+                # The exception *type*, not its message: a connection error's
+                # detail is a host and port, and this is read back out through
+                # an unauthenticated endpoint. See `status`.
+                self._disabled_reason = f"unreachable ({type(exc).__name__})"
                 return None
 
             self._client = client
             self._announced_disabled = False
+            self._disabled_reason = None
             log.info(
                 "checkpoint_cache_connected",
                 url=_redact(url),
@@ -330,6 +372,7 @@ class CheckpointCache:
         what ``make serve`` does), so it is not a warning, and repeating it every
         30 s would bury the logs that matter.
         """
+        self._disabled_reason = reason
         if self._announced_disabled:
             return
         self._announced_disabled = True
@@ -340,6 +383,7 @@ class CheckpointCache:
         with self._lock:
             self._client = None
             self._probe_after = time.monotonic() + RETRY_AFTER_SECONDS
+            self._disabled_reason = f"{operation} failed ({type(exc).__name__})"
         log.warning(
             "checkpoint_cache_command_failed",
             operation=operation,

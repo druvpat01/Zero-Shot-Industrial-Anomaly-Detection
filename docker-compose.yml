@@ -5,6 +5,7 @@
 #   docker compose up --build
 #   python scripts/run_api_demo.py --base-url http://localhost:8000
 #
+#   Dashboard  http://localhost:8501    <- start here; docs/demo_script.md
 #   API        http://localhost:8000/docs
 #   Prometheus http://localhost:9090/targets
 #   Grafana    http://localhost:3000   (admin / $GRAFANA_ADMIN_PASSWORD)
@@ -23,6 +24,7 @@
 # edge here is a `service_healthy` condition, and the chain is
 #
 #   redis -> api -> prometheus -> grafana
+#                -> dashboard
 #
 # Prometheus waiting for the API to be *healthy* is the one that matters: a
 # scrape against a target that is not listening yet is a scrape error, and the
@@ -174,6 +176,89 @@ services:
       start_period: 15s
     restart: unless-stopped
 
+  dashboard:
+    # A stock python:3.11-slim, not the API image, and that is the design rather
+    # than a shortcut. dashboard.py imports nothing from `app/` — it is an HTTP
+    # client — so the container it runs in needs streamlit and requests and none
+    # of the ~1.8 GB of torch, anomalib and onnxruntime the API is built on. The
+    # separation is also the demo's own proof: if the dashboard draws a heatmap,
+    # it got that heatmap from the service over the network, because there is no
+    # model in this container it could have produced one with.
+    image: python:3.11-slim
+    working_dir: /app
+    # The install happens at start, on a stock image, rather than in a Dockerfile
+    # that would have to be rebuilt on every edit to a file this small. It is
+    # ~200 MB of wheels, most of which the pip cache below makes a no-op on the
+    # second `up`. `--no-cache-dir` is deliberately *absent* for that reason.
+    #
+    # exec, so streamlit is PID 1 and receives SIGTERM directly — without it,
+    # `docker compose down` waits out the ten-second kill timeout on a shell that
+    # is not forwarding signals.
+    command:
+      - /bin/sh
+      - -c
+      - |
+        pip install --quiet --root-user-action=ignore -r requirements-dashboard.txt &&
+        exec streamlit run dashboard.py --server.port 8501 --server.address 0.0.0.0
+    environment:
+      # `localhost` here would be this container. The API is reachable by service
+      # name on the compose network, and this is the one setting that has to
+      # differ from a dashboard run on the host with `streamlit run dashboard.py`.
+      DASHBOARD_API_URL: http://api:8000
+      # No first-run email prompt, no telemetry, no attempt to open a browser
+      # that does not exist in here.
+      STREAMLIT_SERVER_HEADLESS: "true"
+      STREAMLIT_BROWSER_GATHER_USAGE_STATS: "false"
+      # File-watching a bind mount means polling, which is a core of CPU spent
+      # noticing that nothing changed. Restart the service to pick up an edit.
+      STREAMLIT_SERVER_FILE_WATCHER_TYPE: none
+      # Three values interpolated out of .env, rather than `env_file: [.env]`
+      # like the API has. The API needs the whole file; this needs a default for
+      # a dropdown and two credentials, and pulling in the other forty would put
+      # the Grafana password and every model hyperparameter in a container that
+      # reads none of them. Least privilege applies to environments too.
+      #
+      # The keys prefill the sidebar's boxes so a live demo needs no typing —
+      # which works because one .env configures both processes on one machine. A
+      # real deployment issues the dashboard its own key rather than handing it
+      # the service's list; see `_default_key` in dashboard.py.
+      DEFAULT_CATEGORY: ${DEFAULT_CATEGORY:-bottle}
+      VIEWER_API_KEYS: ${VIEWER_API_KEYS:-}
+      OPERATOR_API_KEYS: ${OPERATOR_API_KEYS:-}
+    volumes:
+      # Just the two files it runs, read-only. Not the repo: this container has
+      # no business reading ./data or writing ./results, and the narrow mount is
+      # what keeps "it is only a client" true rather than merely intended.
+      - ./dashboard.py:/app/dashboard.py:ro
+      - ./requirements-dashboard.txt:/app/requirements-dashboard.txt:ro
+      - dashboard-pip-cache:/root/.cache/pip
+    ports:
+      - "8501:8501"
+    depends_on:
+      # service_healthy, like everything else here. The dashboard's sidebar
+      # pings /health on load, and a green stack that says "API unreachable" for
+      # the first fifteen seconds is a support question nobody needs.
+      api:
+        condition: service_healthy
+    healthcheck:
+      # Streamlit's own liveness endpoint. Python rather than curl or wget:
+      # python:3.11-slim ships neither, and installing one to check on the other
+      # is 5 MB for something the interpreter already does.
+      test:
+        - CMD
+        - python
+        - -c
+        - |
+          import sys, urllib.request
+          sys.exit(0 if urllib.request.urlopen("http://127.0.0.1:8501/_stcore/health", timeout=5).status == 200 else 1)
+      interval: 15s
+      timeout: 8s
+      # Generous, because the first start pays for the pip install above on a
+      # cold cache. Steady state is a few seconds.
+      start_period: 120s
+      retries: 5
+    restart: unless-stopped
+
 volumes:
   # Prometheus' TSDB and Grafana's sqlite. Named volumes rather than bind
   # mounts: they are databases with their own on-disk formats, owned by users
@@ -183,3 +268,6 @@ volumes:
   prometheus-data:
   grafana-data:
   model-cache:
+  # Wheels for the dashboard's start-time install. Turns a ~40 s first boot into
+  # a ~5 s one on every subsequent `docker compose up`.
+  dashboard-pip-cache:
