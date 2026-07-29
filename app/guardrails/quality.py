@@ -157,8 +157,8 @@ class GuardConfig:
         min_resolution: Reject when either side is below this, in pixels. ``64``.
         max_aspect_ratio: Reject when ``width/height`` is above this or below its
             reciprocal. ``10.0``.
-        dark_level: A pixel at or below this counts as floor-clipped. ``10``.
-        bright_level: A pixel at or above this counts as ceiling-clipped. ``245``.
+        dark_level: A pixel strictly below this counts as floor-clipped. ``10``.
+        bright_level: A pixel strictly above this counts as ceiling-clipped. ``245``.
         exposure_fraction: Reject when this fraction of pixels is floor- or
             ceiling-clipped. ``0.95``.
         blur_resize_edge: Longest edge, in pixels, the frame is downscaled to

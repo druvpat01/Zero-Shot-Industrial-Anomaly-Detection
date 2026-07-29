@@ -19,7 +19,7 @@ What is stored, and what is not
 ===============================
 Four fields per model: ``backend``, ``category``, ``checkpoint_path`` and
 ``loaded_at``. **Not the weights.** A PatchCore checkpoint is 221 MB and its
-ONNX export 362 MB; pushing those through Redis would be slower than reading the
+ONNX export 346 MB; pushing those through Redis would be slower than reading the
 file already sitting on the volume, and it would put a cache eviction between
 the service and its ability to answer at all. What is cached is a note saying
 "this pair was in use, and this is the artifact it came from". The load path is

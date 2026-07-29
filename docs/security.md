@@ -24,7 +24,8 @@ OPERATOR_API_KEYS=ops-console
 | Endpoint     | Role required | Cost of one call            | What it reveals / changes             |
 | ------------ | ------------- | --------------------------- | ------------------------------------- |
 | `/health`    | *none*        | none                        | liveness, names of resident models    |
-| `/predict`   | `viewer`      | one frame (~150 ms)         | one score and one heatmap             |
+| `/metrics`   | *none*        | none                        | aggregate request counts and latencies — see below |
+| `/predict`   | `viewer`      | one frame (~0.5 s measured; see [`performance.md`](performance.md#latency)) | one score and one heatmap |
 | `/models`    | `operator`    | a few `stat` calls          | artifact paths, which categories exist |
 | `/drift`     | `operator`    | a KS test over ≤500 floats  | the score distribution of **live production traffic** |
 | `/calibrate` | `operator`    | a threshold sweep (~ms)     | **changes how every later request is graded** |
@@ -56,7 +57,7 @@ control at all that still answers 200 to everything. `/health` stays up so an
 orchestrator sees a live pod with a broken config rather than one it restarts
 forever.
 
-### Why `/health` is the exception
+### Why `/health` and `/metrics` are the exceptions
 
 A kubelet liveness probe cannot hold a credential, and a health check that can
 fail closed on an authentication problem will eventually restart a perfectly
@@ -65,6 +66,17 @@ protecting against. So `/health` is open, and what it discloses is bounded to
 match: that the process is alive, and the names of the models currently resident.
 Both are strictly less than an anonymous caller learns from the port being open
 at all.
+
+`/metrics` is open for the same shape of reason and with a different trade-off.
+A Prometheus server scrapes on a timer and has nowhere good to hold a
+credential — every workaround (a key in the scrape config, a sidecar that
+injects one) moves the secret somewhere with worse access control than the API
+has. What it discloses is real but aggregate: request counts by model and
+category, latency histograms, guard rejection counts by reason. That is enough to
+infer *how busy* a line is and roughly *how often* it rejects frames — coarser
+than `/drift`, which is why that one is gated and this one is not. **The control
+for `/metrics` is the network, not a key**: bind it to an internal interface, or
+scrape it through a sidecar, and do not publish it alongside the inference port.
 
 ---
 
@@ -384,5 +396,8 @@ curl -s localhost:8000/models -H "X-API-Key: $VIEWER_KEY"        # 403
 tail -n 1 results/audit.jsonl | python -m json.tool
 ```
 
-Never commit `.env`. It is in `.gitignore`; the keys in `.env.example` are
-placeholders and must not be used.
+Never commit `.env`. It is in `.gitignore`; the keys in `.env.example`
+(`dev-viewer-key`, `dev-operator-key`) are development defaults that make
+`docker compose up` work out of the box, and are public by construction. They
+must never reach anything reachable from outside a laptop — generate real ones
+with the command above.

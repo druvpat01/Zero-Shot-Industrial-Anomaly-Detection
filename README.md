@@ -13,15 +13,52 @@ or no defect supervision, suitable for real-time QA on a manufacturing line.
 
 ## Architecture
 
-_Placeholder — to be filled in as components land._
+One frame's path through the service, in the order it happens:
 
-- **Data** — dataset download, preprocessing, and datamodule wrappers.
-- **Models** — PatchCore, EfficientAD, and WinCLIP wrappers behind a common interface.
-- **Evaluation** — AUROC, AU-PRO, and F1 metrics with a benchmark runner, plus
-  score-distribution drift detection and threshold calibration.
-- **Guardrails** — input frame quality validation before inference.
-- **Serving** — FastAPI routes, schemas, and session management.
-- **Observability** — structured logging, Prometheus metrics, and tracing.
+```
+frame ─▶ FrameGuard ─▶ ModelRegistry ─▶ backend ─▶ ModelOutput ─▶ drift monitor ─▶ JSON + heatmap
+         blur/size/     lazy-load +     one of 5    score +        rolling KS       base64 PNG
+         exposure       Redis metadata              heatmap        window
+```
+
+[`docs/architecture.md`](docs/architecture.md) is the full diagram with the
+thresholds, the error codes and the reasoning for each stage.
+
+- **Data** — dataset download, preprocessing, and datamodule wrappers, keeping
+  anomalib's input types out of everything downstream.
+- **Models** — PatchCore, EfficientAD, and WinCLIP behind one
+  [`AnomalyModel`](app/models/base.py) interface: four methods and one output
+  type, which is what lets a PyTorch wrapper be swapped for an ONNX graph without
+  a route change. PatchCore needs ~200 good images, EfficientAD the same,
+  **WinCLIP needs none** — it scores zero-shot from CLIP text prompts, which is
+  the cold-start argument for the whole platform.
+- **ONNX export** — [`scripts/export_onnx.py`](scripts/export_onnx.py) exports
+  PatchCore and EfficientAD to FP32 and INT8 graphs, served by
+  [`ONNXRunner`](app/models/onnx_runner.py) as ordinary `AnomalyModel`s. So the
+  wire accepts five backends: `patchcore`, `efficientad`, `winclip`,
+  `onnx_patchcore`, `onnx_efficientad`. Asking for `patchcore` when only the
+  export exists serves the graph and says `onnx_patchcore` in the response rather
+  than 503-ing. **PatchCore ONNX FP32 is the path to ship** — same accuracy to the
+  fourth decimal, −12% median and −24% p99 latency; INT8 measured *slower* and
+  less accurate, and WinCLIP is not exportable at all.
+  [`docs/performance.md`](docs/performance.md) has every number and why.
+- **Evaluation** — AUROC, AU-PRO, and F1 metrics implemented from scratch with a
+  benchmark runner, plus score-distribution drift detection and threshold
+  calibration. [`docs/evaluation.md`](docs/evaluation.md).
+- **Guardrails** — five input-quality checks (size, aspect ratio, under/over
+  exposure, blur) in most-fundamental-first order, so a bad frame is rejected
+  without loading a model. Measured at 1.3 ms on a 256×256 frame and 23 ms on a
+  900×900 one — the cost scales with pixel count, not with the model.
+- **Serving** — FastAPI routes and schemas, a lazy model registry, and an
+  optional Redis cache of *which* models were resident — metadata, never weights.
+- **Auth** — two roles on one `X-API-Key` header. `viewer` opens `/predict`;
+  `operator` adds `/models`, `/drift`, `/calibrate` and `/benchmark`, and nests
+  viewer. `/health` and `/metrics` are open — a liveness probe and a scraper have
+  nowhere good to hold a credential — and a server with no keys configured
+  refuses everything else with `503`. [`docs/security.md`](docs/security.md).
+- **Observability** — structlog to stderr (JSON on demand), five Prometheus
+  metrics, OpenTelemetry spans per pipeline stage, and an append-only audit trail
+  for the two calls that cost real money or change how parts are graded.
 - **Deployment** — a five-service compose stack (api, redis, prometheus,
   grafana, dashboard) built from [`docker/`](docker/); see the Quickstart.
 
